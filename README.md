@@ -25,7 +25,7 @@ Social/news activity ─┘                                      │
                                          walk-forward / cost-aware evaluation
 ```
 
-The native `src/crypto_pump` layer is clean-room integration code. The 15 upstream projects are fetched into `external/upstreams/` by `scripts/bootstrap_upstreams.py`; that directory is ignored by Git. This preserves upstream history/licensing and avoids silently relicensing repositories that do not declare a permissive license.
+The native `src/crypto_pump` layer is clean-room integration code. The 15 selected research repositories are pinned as Git submodules under `upstreams/`, so one recursive clone restores the exact upstream revisions selected for this project without copying or silently relicensing their source. `scripts/bootstrap_upstreams.py` is also provided for a separate ignored `external/upstreams/` research workspace and writes the resolved SHAs to a local lock file.
 
 ## Upstream research set (15)
 
@@ -50,11 +50,15 @@ See `upstreams.yaml` and `docs/UPSTREAMS.md`.
 ## Quick start
 
 ```bash
+# Exact unified research tree including all 15 pinned upstreams
+git clone --recurse-submodules https://github.com/Shtenco/crypto_pump.git
+cd crypto_pump
+
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .
 
-# Clone all 15 upstream research repositories
+# Alternative: clone the same research sources into an ignored workspace
 python scripts/bootstrap_upstreams.py
 
 # Build leakage-safe features from a normalized CSV
@@ -68,6 +72,12 @@ crypto-pump train data/processed/labeled.parquet artifacts/model.joblib
 
 # Rank every symbol at the latest timestamp
 crypto-pump rank data/processed/labeled.parquet artifacts/model.joblib artifacts/latest_ranking.csv --top-k 20
+```
+
+If the main repository was already cloned without submodules:
+
+```bash
+git submodule update --init --recursive
 ```
 
 ## Canonical normalized schema
@@ -131,9 +141,10 @@ Trading evaluation should additionally include fees, spread, slippage, market im
 ```text
 configs/                 model/label configuration
 src/crypto_pump/         unified clean-room ML pipeline
-scripts/                 upstream bootstrap and research utilities
+upstreams/               15 pinned Git submodules
+scripts/                 bootstrap and research utilities
 docs/                    source map and methodology
-external/upstreams/      cloned third-party projects (gitignored)
+external/upstreams/      optional cloned research workspace (gitignored)
 data/                    local datasets (gitignored)
 artifacts/               local models/reports (gitignored)
 tests/                   leakage and feature tests
@@ -141,4 +152,4 @@ tests/                   leakage and feature tests
 
 ## Status
 
-V1 establishes the reproducible 15-repository research corpus plus a native leakage-safe feature/label/ranking core. The next stage is to add source-specific adapters, walk-forward ensemble calibration, graph features, and exchange/DEX collectors.
+V1 contains the 15 pinned upstream repositories plus a native leakage-safe feature/label/ranking core. The next stage is to add source-specific adapters, walk-forward ensemble calibration, graph embeddings, social encoders and exchange/DEX collectors.
