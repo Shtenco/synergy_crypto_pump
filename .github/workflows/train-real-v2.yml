@@ -1,0 +1,131 @@
+name: Train REAL V2 (Uniswap + LATOKEN)
+
+on:
+  workflow_dispatch:
+    inputs:
+      latoken_days:
+        description: "LATOKEN history days"
+        required: false
+        default: "14"
+      latoken_max_pairs:
+        description: "Maximum LATOKEN USDT pairs"
+        required: false
+        default: "120"
+      uniswap_blocks:
+        description: "Recent Ethereum blocks for Uniswap swaps"
+        required: false
+        default: "80000"
+      uniswap_max_pools:
+        description: "Maximum recent quote pools"
+        required: false
+        default: "100"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/train-real-v2.yml"
+      - "src/crypto_pump/data_sources/**"
+      - "scripts/build_real_dataset_v2.py"
+      - "scripts/summarize_real_v2.py"
+      - "configs/real_v2.yaml"
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  ETH_RPC_URL: ${{ secrets.ETH_RPC_URL }}
+  ENVIO_API_TOKEN: ${{ secrets.ENVIO_API_TOKEN }}
+
+jobs:
+  train-real-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[boosting]'
+
+      - name: Install Rust for Cryo
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Cryo
+        run: |
+          if ! command -v cryo >/dev/null 2>&1; then
+            cargo install cryo_cli --version 0.2.0 --locked || cargo install cryo_cli
+          fi
+          cryo --version
+
+      - name: Select RPC fallback
+        run: |
+          if [ -z "$ETH_RPC_URL" ]; then
+            echo "ETH_RPC_URL=https://eth.llamarpc.com" >> "$GITHUB_ENV"
+            echo "Using public Ethereum RPC fallback"
+          else
+            echo "Using repository ETH_RPC_URL secret"
+          fi
+
+      - name: Collect real Uniswap + LATOKEN panel
+        run: |
+          LAT_DAYS="${{ github.event.inputs.latoken_days || '14' }}"
+          LAT_PAIRS="${{ github.event.inputs.latoken_max_pairs || '120' }}"
+          UNI_BLOCKS="${{ github.event.inputs.uniswap_blocks || '80000' }}"
+          UNI_POOLS="${{ github.event.inputs.uniswap_max_pools || '100' }}"
+          python scripts/build_real_dataset_v2.py \
+            --latoken-days "$LAT_DAYS" \
+            --latoken-max-pairs "$LAT_PAIRS" \
+            --uniswap-blocks "$UNI_BLOCKS" \
+            --uniswap-max-pools "$UNI_POOLS" \
+            --out data/real_v2/panel.parquet \
+            --report artifacts/real_v2/data_report.json
+
+      - name: Build leakage-safe V2 features
+        run: |
+          crypto-pump features-v2 data/real_v2/panel.parquet data/real_v2/features.parquet \
+            --benchmark-symbol LATOKEN:BTCUSDT
+
+      - name: Build strict multi-horizon labels
+        run: |
+          crypto-pump labels-v2 data/real_v2/features.parquet data/real_v2/labeled.parquet
+
+      - name: Purged walk-forward OOS training
+        run: |
+          crypto-pump walk-forward-v2 data/real_v2/labeled.parquet artifacts/real_v2/oos \
+            --n-splits 3 --top-k 10 --model-kind catboost
+
+      - name: Fit final V2 model
+        run: |
+          mkdir -p artifacts/real_v2/model
+          crypto-pump train-v2 data/real_v2/labeled.parquet artifacts/real_v2/model/crypto_pump_v2.joblib \
+            --model-kind catboost
+
+      - name: Build run summary
+        if: always()
+        run: |
+          python scripts/summarize_real_v2.py || true
+          if [ -f artifacts/real_v2/SUMMARY.md ]; then
+            cat artifacts/real_v2/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload dataset/model/reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-pump-real-v2-${{ github.run_id }}
+          path: |
+            data/real_v2/panel.parquet
+            data/real_v2/features.parquet
+            data/real_v2/labeled.parquet
+            artifacts/real_v2/
+          if-no-files-found: warn
+          retention-days: 30

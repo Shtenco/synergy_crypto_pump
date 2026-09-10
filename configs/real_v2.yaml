@@ -1,0 +1,19 @@
+bar_interval: 5min
+latoken:
+  quote: USDT
+  days: 14
+  max_pairs: 120
+uniswap_v3:
+  chain: ethereum
+  collector: cryo
+  factory: "0x1f98431c8ad98523631ae4a59f267346ea31f984"
+  lookback_blocks: 80000
+  max_quote_pools: 100
+  quote_tokens: [WETH, USDC, USDT, DAI]
+training:
+  targets: [up10_15m, up20_1h, up50_6h, up100_24h]
+  model_kind: catboost
+  n_splits: 3
+  top_k: 10
+  purge_bars: 288
+  embargo_bars: 12
