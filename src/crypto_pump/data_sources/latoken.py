@@ -42,6 +42,11 @@ def _resolve_currency(v: Any, by_id: dict[str, str]) -> str:
     return by_id.get(s.lower(), s.upper())
 
 
+def _looks_unresolved_uuid(s: str) -> bool:
+    s = str(s or "")
+    return len(s) == 36 and s.count("-") == 4
+
+
 def _pair_universe(quote: str = "USDT") -> list[tuple[str, str]]:
     by_id, _ = _currencies()
     rows = _unwrap(http_json(f"{BASE}/v2/pair"))
@@ -52,8 +57,6 @@ def _pair_universe(quote: str = "USDT") -> list[tuple[str, str]]:
         if not isinstance(r, dict):
             continue
         status = str(r.get("status") or "").upper()
-        # Keep active and historical rows if the endpoint exposes them. Do not
-        # filter only by today's active set: that would create survivorship bias.
         if status and "PAIR_STATUS" in status and status not in {
             "PAIR_STATUS_ACTIVE", "PAIR_STATUS_INACTIVE", "PAIR_STATUS_DISABLED"
         }:
@@ -62,10 +65,17 @@ def _pair_universe(quote: str = "USDT") -> list[tuple[str, str]]:
         quote_raw = r.get("quoteCurrency") or r.get("quote") or r.get("quoteAsset")
         base = _resolve_currency(base_raw, by_id)
         q = _resolve_currency(quote_raw, by_id)
+        # Some /v2/pair rows reference currencies no longer returned by
+        # /v2/currency. A raw UUID cannot be used as TradingView symbol.
+        if _looks_unresolved_uuid(base) or _looks_unresolved_uuid(q):
+            continue
         if base and q == quote.upper() and base != q:
             out.add((base, q))
-    # BTC first so the benchmark is retained even when max_pairs is small.
     return sorted(out, key=lambda x: (x[0] != "BTC", x[0]))
+
+
+def _series(values: Any, n: int) -> pd.Series:
+    return pd.Series(list(values[:n]), dtype="object")
 
 
 def _parse_tv(payload: Any, base: str, quote: str) -> pd.DataFrame:
@@ -86,17 +96,14 @@ def _parse_tv(payload: Any, base: str, quote: str) -> pd.DataFrame:
     if not n:
         return pd.DataFrame()
 
-    close = pd.to_numeric(c[:n], errors="coerce")
-    # LATOKEN's own candle example reports v in quote-value scale (e.g. BTC/USDT
-    # volume around millions while price is ~50k). Preserve that as quote_volume;
-    # derive base volume only for the common OHLCV contract.
-    qvol = pd.to_numeric(v[:n], errors="coerce").fillna(0.0)
+    close = pd.to_numeric(_series(c, n), errors="coerce")
+    qvol = pd.to_numeric(_series(v, n), errors="coerce").fillna(0.0)
     base_vol = qvol / close.replace(0.0, np.nan)
     d = pd.DataFrame({
-        "timestamp": pd.to_datetime(np.asarray(ts[:n], dtype="int64"), unit="s", utc=True),
-        "open": pd.to_numeric(o[:n], errors="coerce"),
-        "high": pd.to_numeric(h[:n], errors="coerce"),
-        "low": pd.to_numeric(l[:n], errors="coerce"),
+        "timestamp": pd.to_datetime(pd.to_numeric(_series(ts, n), errors="coerce"), unit="s", utc=True),
+        "open": pd.to_numeric(_series(o, n), errors="coerce"),
+        "high": pd.to_numeric(_series(h, n), errors="coerce"),
+        "low": pd.to_numeric(_series(l, n), errors="coerce"),
         "close": close,
         "volume": base_vol.fillna(0.0),
         "quote_volume": qvol,
@@ -164,13 +171,7 @@ def collect_latoken_panel(
     workers: int = 10,
     chunk_hours: int = 72,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Collect LATOKEN 1-minute public candles and aggregate causally to 5m.
-
-    LATOKEN does not document a native 5m resolution. We therefore request the
-    documented 1m resolution in bounded windows, de-duplicate, then aggregate.
-    `end_offset_days` makes historical GitHub Actions sharding reproducible.
-    `max_pairs=0` means all USDT pairs exposed by /v2/pair.
-    """
+    """Collect LATOKEN 1-minute public candles and aggregate causally to 5m."""
     anchor = end or datetime.now(timezone.utc)
     end = (anchor - timedelta(days=max(0, end_offset_days))).replace(second=0, microsecond=0)
     start = end - timedelta(days=max(1, days))
