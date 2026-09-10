@@ -15,6 +15,7 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install --upgrade pip
       - run: pip install -e '.[dev]'
+      - run: python -m compileall -q src scripts
       - run: pytest -q
 
   verify-upstreams:
@@ -26,3 +27,4 @@ jobs:
           python-version: '3.11'
       - run: pip install pyyaml
       - run: python scripts/bootstrap_upstreams.py --depth 1
+      - run: python scripts/verify_v2_sources.py

@@ -1,155 +1,176 @@
-# CRYPTO PUMP — Unified ML Research Stack
+# CRYPTO PUMP V2 — Unified Early-Pump ML Research Stack
 
-Research monorepo for **early pump / abnormal-upside prediction** in low-cap cryptocurrencies and memecoins.
+`crypto_pump` is a research monorepo for **forward prediction and cross-sectional ranking of abnormal upside in low-cap cryptocurrencies and memecoins**.
 
-The goal is not to detect a pump after it is obvious. The core target is strictly forward-looking:
+The repository pins 15 public research/codebases as Git submodules and distills their strongest reproducible ideas into one native V2 pipeline.
 
-```text
-P(max_return(symbol, t+1 ... t+H) >= R | information available at or before t)
-```
+> Research only. Pump-and-dump markets are adversarial and manipulated. A prediction metric or backtest is not evidence of executable profit. Point-in-time universe construction, delistings, fees, spread, slippage, market impact and latency must be included before any trading conclusion.
 
-and a cross-sectional ranking of the whole tradable universe at each timestamp.
+## The V2 question
 
-> Research only. Pump-and-dump markets are highly manipulated and execution costs, slippage, delistings, survivorship bias and data leakage can destroy apparent backtest alpha. The repository deliberately separates prediction quality from trading PnL.
-
-## Architecture
+V2 deliberately does **not** optimize "is this candle already pumping?". It estimates four future events from information available at or before `t`:
 
 ```text
-CEX OHLCV/order flow ─┐
-DEX/on-chain wallets ─┼─> feature store ─> horizon labels ─> models ─> calibrated ensemble
-Social/news activity ─┘                                      │
-                                                             v
-                                                cross-sectional Top-K ranking
-                                                             │
-                                                             v
-                                         walk-forward / cost-aware evaluation
+P(+10% within 15m | X<=t)
+P(+20% within 1h  | X<=t)
+P(+50% within 6h  | X<=t)
+P(+100% within 24h| X<=t)
 ```
 
-The native `src/crypto_pump` layer is clean-room integration code. The 15 selected research repositories are pinned as Git submodules under `upstreams/`, so one recursive clone restores the exact upstream revisions selected for this project without copying or silently relicensing their source. `scripts/bootstrap_upstreams.py` is also provided for a separate ignored `external/upstreams/` research workspace and writes the resolved SHAs to a local lock file.
+Defaults assume 5-minute bars. Each target is built from future highs versus the current close and stores MFE, MAE, end-of-horizon return and first target-hit bar. Rows without the complete future horizon are censored rather than mislabeled as negatives.
 
-## Upstream research set (15)
+## Distilled architecture
 
-1. `B0R0koko/pump-and-dump-prediction` — pre-pump cross-sectional target ranking and microstructure.
-2. `Bayi-Hu/Pump-and-Dump-Detection-on-Cryptocurrency` — sequence-based target coin prediction.
-3. `cakcora/Chainoba` — classical pump prediction / anomaly feature engineering.
-4. `baseershah7/Solana_Memecoin_Graduation` — early Pump.fun graduation prediction.
-5. `gayatri1505/Solana-Memcoin-Prediction-Using-Machine-Learning` — early-block Solana memecoin ensemble.
-6. `Based-LTD/graduate-oracle` — graduation probability / wallet-quality methodology and public artifacts.
-7. `Wendy1890/crypto_pump_predictor_bot` — multi-exchange ML scanner.
-8. `Derposoft/crypto_pump_and_dump_with_deep_learning` — Conv-LSTM / Transformer anomaly models.
-9. `uasth/CryptoAnomalyDetection` — high-frequency temporal anomaly detection.
-10. `lidialosavio-dotcom/crypto_fraud_stGNN` — spatio-temporal graph learning.
-11. `Confringo233/PumpWatcher` — graph + contrastive learning for DeFi pump/dump patterns.
-12. `mfzhang/20260115-Pump_and_Dump_detect_signal` — market + social/news signal modelling.
-13. `Mehrnoom/Cryptocurrency-Pump-Dump` — large social/Telegram research dataset and analysis.
-14. `lodetomasi/the-intelligent-llm-investor` — social-momentum / coordination detection.
-15. `RaibekTussupbekov/binance-pump-dump-detector` — Bayesian change-point regime detector.
+```text
+CEX OHLCV / order flow ───────┐
+DEX / launch / wallet data ───┤
+Social / news aggregates ─────┼──> causal V2 feature store
+BTC / market benchmark ───────┘                │
+                                               ├─> multi-horizon CatBoost
+                                               ├─> CatBoost YetiRank / NDCG
+past-only symbol sequences ────────────────────┼─> causal Temporal Transformer
+wallet ↔ token edges (timestamp <= as_of) ─────┼─> Wallet/Transaction GNN
+social-only feature family ────────────────────┼─> social branch
+BTC-relative residual ─────────────────────────┴─> BOCD regime score
+                                                         │
+                                                         v
+                                             validation-only stacker
+                                                         │
+                                             isotonic calibration
+                                                         │
+                                                         v
+                                              4 pump probabilities
+                                                         │
+                                                         v
+                                             per-timestamp Top-K rank
+```
 
-See `upstreams.yaml` and `docs/UPSTREAMS.md`.
+The final score is not a hand-weighted average. Branch outputs are fitted by a validation-only logistic stacker; with enough support the result is isotonic-calibrated.
 
-## Quick start
+## Validation
+
+Several useful upstream repositories use random train/test splits or shuffled StratifiedKFold. Those procedures are unsafe for a time-evolving trading problem. V2 uses expanding **purged walk-forward OOS**:
+
+```text
+TRAIN | longest-target purge | VALIDATION | purge + embargo | TEST
+```
+
+For the default 24-hour target on 5-minute bars, the purge is `288` bars. Every test probability is generated by a model trained and calibrated on earlier timestamps only.
+
+## Feature families
+
+V2 clean-room distills:
+
+- **microstructure:** quote-volume z-score, volume/trade acceleration, buy pressure, flow/depth/slippage imbalance, long-trade share, RSI, volatility and cross-sectional ranks;
+- **pre-breakout:** activity acceleration versus bounded current price displacement, compression and distance-to-range features;
+- **launch/on-chain:** `tx_per_sec`, time-decayed activity, liquidity growth, creator history and virtual liquidity;
+- **wallet quality:** Gini/top-wallet concentration, repeat/dust/unknown/low-history/sniper rates, smart-wallet score and bot-pressure composites;
+- **social:** mentions, unique users, sentiment, velocity, acceleration, z-scores, cross-platform breadth and coordination;
+- **regime:** asset-vs-BTC residual plus bounded Bayesian Online Changepoint Detection.
+
+See [`docs/UPSTREAM_AUDIT_V2.md`](docs/UPSTREAM_AUDIT_V2.md) for the 15-source audit and exactly what was accepted/rejected.
+
+## Install
 
 ```bash
-# Exact unified research tree including all 15 pinned upstreams
 git clone --recurse-submodules https://github.com/Shtenco/crypto_pump.git
 cd crypto_pump
-
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .
-
-# Alternative: clone the same research sources into an ignored workspace
-python scripts/bootstrap_upstreams.py
-
-# Build leakage-safe features from a normalized CSV
-crypto-pump features data/raw/market.csv data/processed/features.parquet
-
-# Create future-horizon labels
-crypto-pump labels data/processed/features.parquet data/processed/labeled.parquet --horizon 12 --threshold 0.20
-
-# Train a baseline cross-sectional probability model
-crypto-pump train data/processed/labeled.parquet artifacts/model.joblib
-
-# Rank every symbol at the latest timestamp
-crypto-pump rank data/processed/labeled.parquet artifacts/model.joblib artifacts/latest_ranking.csv --top-k 20
 ```
 
-If the main repository was already cloned without submodules:
+For CatBoost/XGBoost/LightGBM: `pip install -e '.[boosting]'`.
+For the causal Transformer + wallet GNN: `pip install -e '.[deep,boosting]'`.
+
+Alternative research sandbox:
 
 ```bash
-git submodule update --init --recursive
+python scripts/bootstrap_upstreams.py
+python scripts/verify_v2_sources.py
 ```
 
-## Canonical normalized schema
+## Input schemas
 
-Minimum columns:
+Minimum market panel:
 
 ```text
 timestamp,symbol,open,high,low,close,volume
 ```
 
-Optional columns are automatically consumed when available:
+Useful optional columns include:
 
 ```text
-trades,buy_volume,sell_volume,bid_depth,ask_depth,spread,
-unique_buyers,unique_sellers,holders,liquidity,
-social_mentions,social_users,creator_success,top5_share,sniper_share
+quote_volume,trades,buy_volume,sell_volume,bid_depth,ask_depth,
+taker_buy_quote,buy_trade_count,quote_slippage_signed,quote_slippage_abs,
+unique_buyers,unique_sellers,holders,liquidity,activity_duration_sec,age_seconds,
+current_vsol,initial_vsol,creator_success,creator_num_tokens,
+wallet_gini,top_buyer_pct,top3_buyer_pct,top5_share,
+repeat_buyer_rate,dust_buy_rate,unknown_buyer_pct,low_history_pct,
+sniper_pct,avg_top_buyer_smart,social_mentions,social_users,sentiment,
+coordination_score,cross_platform_breadth,new_account_rate
 ```
 
-## Leakage rules
+Optional GNN edge table requires `timestamp,wallet,symbol` and may add `amount,direction,wallet_smart_score`.
 
-1. Features at time `t` may use only observations with timestamp `<= t`.
-2. Future windows are used only by the label/evaluation layer.
-3. Model selection must be chronological/walk-forward, never random row shuffle across time.
-4. Cross-sectional ranking is computed independently inside each timestamp.
+## Run V2
 
-## Default feature families
+```bash
+crypto-pump features-v2 data/raw/market.parquet data/processed/features_v2.parquet
+crypto-pump labels-v2 data/processed/features_v2.parquet data/processed/labeled_v2.parquet
 
-- Price/volatility: returns, realized volatility, ATR proxy, range, drawdown, compression.
-- Volume/flow: volume z-score, acceleration, trade acceleration, buy/sell imbalance.
-- Liquidity: spread, bid/ask depth imbalance, liquidity growth.
-- On-chain: buyer/holder velocity, concentration, creator history, sniper fraction.
-- Social: mention velocity/acceleration, unique-user velocity and market/social divergence.
-- Regime: relative strength vs universe, BTC-relative features when supplied, change intensity.
-
-## Targets
-
-A single dataset can be labelled at several horizons, for example:
-
-```text
-+10% within 15m
-+20% within 1h
-+50% within 6h
-+100% within 24h
+crypto-pump walk-forward-v2 \
+  data/processed/labeled_v2.parquet \
+  artifacts/v2_oos \
+  --model-kind auto
 ```
 
-For each horizon the system can also estimate adverse excursion before target so that a high pump probability is not automatically treated as a tradable signal.
+Full deep stack:
 
-## Evaluation
-
-Primary prediction metrics:
-
-```text
-PR-AUC, ROC-AUC, Brier score, log loss,
-Precision@1, Precision@5, Precision@10, Recall@K, NDCG@K
+```bash
+crypto-pump walk-forward-v2 \
+  data/processed/labeled_v2.parquet \
+  artifacts/v2_oos_deep \
+  --transactions data/processed/wallet_edges.parquet \
+  --enable-temporal \
+  --enable-gnn
 ```
 
-Trading evaluation should additionally include fees, spread, slippage, market impact, latency, rejected fills and delisted/dead tokens.
+After OOS research, fit a final model and score the latest universe:
 
-## Repository layout
-
-```text
-configs/                 model/label configuration
-src/crypto_pump/         unified clean-room ML pipeline
-upstreams/               15 pinned Git submodules
-scripts/                 bootstrap and research utilities
-docs/                    source map and methodology
-external/upstreams/      optional cloned research workspace (gitignored)
-data/                    local datasets (gitignored)
-artifacts/               local models/reports (gitignored)
-tests/                   leakage and feature tests
+```bash
+crypto-pump train-v2 data/processed/labeled_v2.parquet artifacts/crypto_pump_v2.joblib
+crypto-pump rank-v2 data/processed/features_v2.parquet artifacts/crypto_pump_v2.joblib artifacts/latest_v2_ranking.parquet
 ```
 
-## Status
+## OOS artifacts and metrics
 
-V1 contains the 15 pinned upstream repositories plus a native leakage-safe feature/label/ranking core. The next stage is to add source-specific adapters, walk-forward ensemble calibration, graph embeddings, social encoders and exchange/DEX collectors.
+Every walk-forward run writes `fold_N_model.joblib`, `oos_predictions.parquet` and `oos_metrics.json`. The OOS file retains branch-level probabilities so Transformer, GNN, social and BOCD contributions can be ablated independently.
+
+Metrics are reported per horizon: `PR-AUC`, `ROC-AUC`, `Brier`, `Log loss`, `Precision@K`, `NDCG@K`.
+
+## 15 pinned upstream repositories
+
+1. `B0R0koko/pump-and-dump-prediction`
+2. `Bayi-Hu/Pump-and-Dump-Detection-on-Cryptocurrency`
+3. `cakcora/Chainoba`
+4. `baseershah7/Solana_Memecoin_Graduation`
+5. `gayatri1505/Solana-Memcoin-Prediction-Using-Machine-Learning`
+6. `Based-LTD/graduate-oracle`
+7. `Wendy1890/crypto_pump_predictor_bot`
+8. `Derposoft/crypto_pump_and_dump_with_deep_learning`
+9. `uasth/CryptoAnomalyDetection`
+10. `lidialosavio-dotcom/crypto_fraud_stGNN`
+11. `Confringo233/PumpWatcher`
+12. `mfzhang/20260115-Pump_and_Dump_detect_signal`
+13. `Mehrnoom/Cryptocurrency-Pump-Dump`
+14. `lodetomasi/the-intelligent-llm-investor`
+15. `RaibekTussupbekov/binance-pump-dump-detector`
+
+They remain pinned at specific commits under `upstreams/`; native clean-room V2 code is under `src/crypto_pump/v2/`.
+
+Architecture details: [`docs/V2_ARCHITECTURE.md`](docs/V2_ARCHITECTURE.md).
+
+## Current status
+
+**V2 implements the multi-branch training architecture and leakage controls.** The next empirical stage is collecting a point-in-time dataset large enough to train all branches, then running the frozen V2 protocol across exchanges/launchpads and measuring whether each branch contributes incremental OOS Top-K value after realistic costs.

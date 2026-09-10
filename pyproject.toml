@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-pump"
-version = "0.1.0"
-description = "Leakage-safe ML research stack for early abnormal-upside and pump prediction"
+version = "0.2.0"
+description = "Leakage-safe multi-branch ML research stack for early abnormal-upside and pump prediction"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26",
@@ -19,6 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 boosting = ["catboost>=1.2", "lightgbm>=4.0", "xgboost>=2.0"]
+deep = ["torch>=2.2"]
+v2 = ["catboost>=1.2", "torch>=2.2"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

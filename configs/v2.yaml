@@ -1,0 +1,50 @@
+version: 2
+bar_interval: 5m
+
+targets:
+  - {name: up10_15m, horizon_bars: 3, threshold: 0.10}
+  - {name: up20_1h, horizon_bars: 12, threshold: 0.20}
+  - {name: up50_6h, horizon_bars: 72, threshold: 0.50}
+  - {name: up100_24h, horizon_bars: 288, threshold: 1.00}
+
+features:
+  windows: [3, 6, 12, 24, 48, 96]
+  z_window: 96
+  benchmark_symbol: BTCUSDT
+
+branches:
+  tabular_catboost: true
+  catboost_ranker:
+    enabled: true
+    objective: "YetiRank:mode=NDCG"
+  temporal_transformer:
+    enabled: optional
+    sequence_length: 48
+    causal_mask: true
+  wallet_transaction_gnn:
+    enabled: optional
+    lookback: 30min
+    future_edge_filter: true
+  social:
+    enabled: auto
+  bocd:
+    enabled: true
+    hazard_bars: 40
+    max_run_length: 128
+
+stacking:
+  meta_model: logistic_regression
+  calibration: isotonic
+  fit_on: validation_only
+
+walk_forward:
+  folds: 3
+  min_train_fraction: 0.45
+  validation_fraction: 0.10
+  purge_bars: 288
+  embargo_bars: 12
+  expanding_train: true
+
+evaluation:
+  top_k: 10
+  metrics: [pr_auc, roc_auc, brier, log_loss, precision_at_k, ndcg_at_k]
