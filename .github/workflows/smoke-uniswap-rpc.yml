@@ -7,6 +7,8 @@ on:
       - ".github/workflows/smoke-uniswap-rpc.yml"
       - "scripts/build_real_dataset_v2.py"
       - "src/crypto_pump/data_sources/uniswap_cryo.py"
+      - "src/crypto_pump/data_sources/uniswap_resilient.py"
+      - "src/crypto_pump/data_sources/__init__.py"
       - "src/crypto_pump/data_sources/common.py"
   workflow_dispatch:
 
@@ -52,8 +54,8 @@ jobs:
           python scripts/build_real_dataset_v2.py \
             --skip-latoken \
             --uniswap-blocks 12000 \
-            --uniswap-pool-lookback-blocks 100000 \
-            --uniswap-max-pools 80 \
+            --uniswap-pool-lookback-blocks 1500000 \
+            --uniswap-max-pools 100 \
             --min-bars 1 \
             --out data/uniswap_smoke/panel.parquet \
             --report artifacts/uniswap_smoke/report.json
