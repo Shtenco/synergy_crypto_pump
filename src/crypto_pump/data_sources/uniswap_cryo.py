@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
+import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +25,7 @@ QUOTES = {
     "0xdac17f958d2ee523a2206206994597c13d831ec7": ("USDT", 6),
     "0x6b175474e89094c44da98b954eedeac495271d0f": ("DAI", 18),
 }
+DECIMALS_SELECTOR = "0x313ce567"
 
 
 def _clean_hex(x: Any) -> str:
@@ -62,12 +66,21 @@ def _read_csv_tree(root: Path) -> pd.DataFrame:
                 parts.append(d)
         except Exception:
             continue
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    return pd.concat(parts, ignore_index=True, sort=False) if parts else pd.DataFrame()
 
 
 def _run_cryo(args: list[str], *, rpc_url: str, cwd: Path) -> None:
-    cmd = ["cryo", *args, "--rpc", rpc_url, "--requests-per-second", "3", "--max-concurrent-requests", "3", "--max-retries", "6"]
-    subprocess.run(cmd, cwd=cwd, check=True)
+    cmd = [
+        "cryo", *args,
+        "--rpc", rpc_url,
+        "--requests-per-second", "4",
+        "--max-concurrent-requests", "4",
+        "--max-retries", "8",
+    ]
+    proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if proc.returncode:
+        tail = (proc.stdout or "")[-6000:]
+        raise RuntimeError(f"Cryo failed ({proc.returncode}): {' '.join(cmd[:8])}\n{tail}")
 
 
 def _decode_pools(raw: pd.DataFrame) -> pd.DataFrame:
@@ -88,18 +101,95 @@ def _decode_pools(raw: pd.DataFrame) -> pd.DataFrame:
                 pool = _address_from_word(_word(r["data"], 1))
             if fee is None or (isinstance(fee, float) and np.isnan(fee)):
                 fee = int(_clean_hex(r["topic3"]), 16)
-            rows.append({"block_number": int(r["block_number"]), "token0": token0, "token1": token1, "fee": int(fee), "pool": pool})
+            rows.append({
+                "block_number": int(r["block_number"]),
+                "token0": token0,
+                "token1": token1,
+                "fee": int(fee),
+                "pool": pool,
+            })
         except Exception:
             continue
     return pd.DataFrame(rows).drop_duplicates("pool") if rows else pd.DataFrame()
+
+
+def _rpc_batch(rpc_url: str, calls: list[tuple[str, list[Any]]], *, timeout: int = 60, retries: int = 4) -> list[Any]:
+    if not calls:
+        return []
+    body = [
+        {"jsonrpc": "2.0", "id": i, "method": method, "params": params}
+        for i, (method, params) in enumerate(calls)
+    ]
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        rpc_url,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "crypto-pump-v2/0.4"},
+    )
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                payload = json.loads(r.read().decode("utf-8"))
+            if not isinstance(payload, list):
+                raise RuntimeError(f"RPC batch returned {type(payload).__name__}")
+            by_id = {int(x.get("id")): x for x in payload if isinstance(x, dict) and "id" in x}
+            out = []
+            for i in range(len(calls)):
+                row = by_id.get(i, {})
+                if row.get("error"):
+                    out.append(None)
+                else:
+                    out.append(row.get("result"))
+            return out
+        except Exception as exc:
+            last = exc
+            if attempt + 1 < retries:
+                time.sleep(min(8.0, 2.0 ** attempt))
+    raise RuntimeError(f"RPC batch failed after {retries} attempts: {last}")
+
+
+def _token_decimals(rpc_url: str, tokens: list[str], batch_size: int = 40) -> tuple[dict[str, int], list[str]]:
+    out: dict[str, int] = {a: meta[1] for a, meta in QUOTES.items()}
+    failed: list[str] = []
+    todo = sorted({t.lower() for t in tokens if t and t.lower() not in out})
+    for i in range(0, len(todo), batch_size):
+        chunk = todo[i:i + batch_size]
+        calls = [("eth_call", [{"to": t, "data": DECIMALS_SELECTOR}, "latest"]) for t in chunk]
+        try:
+            results = _rpc_batch(rpc_url, calls)
+        except Exception:
+            results = [None] * len(chunk)
+        for token, raw in zip(chunk, results):
+            try:
+                dec = int(str(raw), 16)
+                if 0 <= dec <= 36:
+                    out[token] = dec
+                else:
+                    failed.append(token)
+            except Exception:
+                failed.append(token)
+    return out, failed
+
+
+def _block_timestamps(rpc_url: str, block_numbers: list[int], batch_size: int = 50) -> pd.DataFrame:
+    rows: list[dict[str, int]] = []
+    nums = sorted({int(x) for x in block_numbers})
+    for i in range(0, len(nums), batch_size):
+        chunk = nums[i:i + batch_size]
+        calls = [("eth_getBlockByNumber", [hex(n), False]) for n in chunk]
+        results = _rpc_batch(rpc_url, calls, timeout=90, retries=5)
+        for n, block in zip(chunk, results):
+            if isinstance(block, dict) and block.get("timestamp"):
+                rows.append({"block_number": n, "timestamp": int(block["timestamp"], 16)})
+    return pd.DataFrame(rows)
 
 
 def _decode_swaps(raw: pd.DataFrame, pools: pd.DataFrame, blocks: pd.DataFrame) -> pd.DataFrame:
     if raw.empty or pools.empty or blocks.empty:
         return pd.DataFrame()
     addr_col = "address" if "address" in raw else "contract_address"
-    bnum_col = "number" if "number" in blocks else "block_number"
-    bmap = blocks[[bnum_col, "timestamp"]].drop_duplicates(bnum_col).rename(columns={bnum_col: "block_number"})
+    bmap = blocks[["block_number", "timestamp"]].drop_duplicates("block_number")
     meta = pools.set_index("pool").to_dict("index")
     rows = []
     for _, r in raw.iterrows():
@@ -118,19 +208,24 @@ def _decode_swaps(raw: pd.DataFrame, pools: pd.DataFrame, blocks: pd.DataFrame) 
                 sqrtp = _uint_word(_word(r["data"], 2))
                 liq = _uint_word(_word(r["data"], 3))
             amount0, amount1, sqrtp = int(amount0), int(amount1), int(sqrtp)
-            ratio_1_per_0 = (sqrtp / float(2 ** 96)) ** 2
+            raw_ratio_1_per_0 = (sqrtp / float(2 ** 96)) ** 2
             t0, t1 = m["token0"], m["token1"]
+            d0, d1 = int(m["decimals0"]), int(m["decimals1"])
+
             if t1 in QUOTES and t0 not in QUOTES:
                 quote, qdec = QUOTES[t1]
-                price = ratio_1_per_0
+                # sqrtPrice is raw token1/token0. Convert to human quote/token.
+                price = raw_ratio_1_per_0 * (10.0 ** (d0 - d1))
                 token_amt, quote_amt = amount0, amount1
                 token_addr = t0
             elif t0 in QUOTES and t1 not in QUOTES:
                 quote, qdec = QUOTES[t0]
-                price = 1.0 / ratio_1_per_0 if ratio_1_per_0 > 0 else np.nan
+                price = (1.0 / raw_ratio_1_per_0) * (10.0 ** (d1 - d0)) if raw_ratio_1_per_0 > 0 else np.nan
                 token_amt, quote_amt = amount1, amount0
                 token_addr = t1
             else:
+                continue
+            if not np.isfinite(price) or price <= 0:
                 continue
             side = "buy" if token_amt < 0 else "sell"
             qvol = abs(float(quote_amt)) / (10 ** qdec)
@@ -170,46 +265,127 @@ def _bars(swaps: pd.DataFrame, min_swaps: int = 20) -> pd.DataFrame:
     d["buy_q"] = np.where(d["side"].eq("buy"), d["quote_volume"], 0.0)
     d["sell_q"] = np.where(d["side"].eq("sell"), d["quote_volume"], 0.0)
     bars = d.groupby(["symbol", "bar"], sort=True).agg(
-        open=("price", "first"), high=("price", "max"), low=("price", "min"), close=("price", "last"),
-        volume=("quote_volume", "sum"), quote_volume=("quote_volume", "sum"), trades=("price", "size"),
-        buy_volume=("buy_q", "sum"), sell_volume=("sell_q", "sum"), liquidity=("liquidity", "last"),
-        pool=("pool", "first"), token=("token", "first"), quote=("quote", "first"),
+        open=("price", "first"),
+        high=("price", "max"),
+        low=("price", "min"),
+        close=("price", "last"),
+        quote_volume=("quote_volume", "sum"),
+        trades=("price", "size"),
+        buy_volume=("buy_q", "sum"),
+        sell_volume=("sell_q", "sum"),
+        liquidity=("liquidity", "last"),
+        pool=("pool", "first"),
+        token=("token", "first"),
+        quote=("quote", "first"),
     ).reset_index().rename(columns={"bar": "timestamp"})
+    # The common OHLCV volume field is a token-unit proxy. quote_volume is the
+    # economically comparable field used cross-sectionally.
+    bars["volume"] = bars["quote_volume"] / bars["close"].replace(0.0, np.nan)
+    bars["volume"] = bars["volume"].fillna(0.0)
     bars["source"] = "uniswap"
     return bars
 
 
-def collect_uniswap_v3_panel(*, rpc_url: str, lookback_blocks: int = 80_000, pool_lookback_blocks: int | None = None, max_pools: int = 100, safe_blocks: int = 64, workdir: str | Path | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
+def collect_uniswap_v3_panel(
+    *,
+    rpc_url: str,
+    lookback_blocks: int = 80_000,
+    end_block_offset: int = 0,
+    pool_lookback_blocks: int | None = None,
+    max_pools: int = 100,
+    safe_blocks: int = 64,
+    workdir: str | Path | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Collect one historical Uniswap V3 shard with Cryo.
+
+    `end_block_offset` permits non-overlapping GitHub Actions matrix shards.
+    Pool discovery looks farther back than the swap shard so pools created before
+    the shard boundary are still eligible. Unknown token decimals are fetched
+    on-chain before price conversion; pools with unresolved decimals are dropped.
+    """
     latest_hex = rpc_json(rpc_url, "eth_blockNumber")
     latest = int(latest_hex, 16)
-    end = max(1, latest - safe_blocks)
-    start = max(12_369_621, end - lookback_blocks)
-    pool_start = max(12_369_621, end - int(pool_lookback_blocks or max(lookback_blocks * 4, 250_000)))
+    canonical_end = max(1, latest - safe_blocks)
+    end = max(12_369_622, canonical_end - max(0, end_block_offset))
+    start = max(12_369_621, end - max(1, lookback_blocks))
+    pool_span = int(pool_lookback_blocks or max(lookback_blocks * 6, 500_000))
+    pool_start = max(12_369_621, end - pool_span)
+
     root = Path(workdir or tempfile.mkdtemp(prefix="crypto-pump-cryo-"))
     root.mkdir(parents=True, exist_ok=True)
-    pools_dir, swaps_dir, blocks_dir = root / "pools", root / "swaps", root / "blocks"
-    for p in (pools_dir, swaps_dir, blocks_dir):
+    pools_dir, swaps_dir = root / "pools", root / "swaps"
+    for p in (pools_dir, swaps_dir):
         p.mkdir(parents=True, exist_ok=True)
 
-    _run_cryo(["logs", "--blocks", f"{pool_start}:{end}", "--contract", UNISWAP_V3_FACTORY, "--topic0", POOL_CREATED_TOPIC, "--event-signature", POOL_CREATED_SIG, "--hex", "--csv", "--output-dir", str(pools_dir), "--overwrite", "--inner-request-size", "1000"], rpc_url=rpc_url, cwd=root)
-    pools = _decode_pools(_read_csv_tree(pools_dir))
+    _run_cryo([
+        "logs", "--blocks", f"{pool_start}:{end}",
+        "--contract", UNISWAP_V3_FACTORY,
+        "--topic0", POOL_CREATED_TOPIC,
+        "--event-signature", POOL_CREATED_SIG,
+        "--hex", "--csv", "--output-dir", str(pools_dir),
+        "--overwrite", "--inner-request-size", "1000",
+    ], rpc_url=rpc_url, cwd=root)
+    pools_raw = _read_csv_tree(pools_dir)
+    pools = _decode_pools(pools_raw)
     if pools.empty:
-        return pd.DataFrame(), {"source": "uniswap_cryo", "error": "no PoolCreated rows decoded", "latest": latest, "start": start, "end": end}
+        return pd.DataFrame(), {
+            "source": "uniswap_cryo", "error": "no PoolCreated rows decoded",
+            "latest": latest, "start_block": start, "end_block": end,
+            "pool_scan_start": pool_start, "pool_raw_rows": len(pools_raw),
+        }
+
     mask = pools["token0"].isin(QUOTES) ^ pools["token1"].isin(QUOTES)
-    pools = pools[mask].sort_values("block_number", ascending=False)
+    pools = pools[mask].sort_values("block_number", ascending=False).copy()
+    decimals, failed_decimals = _token_decimals(
+        rpc_url, pools["token0"].tolist() + pools["token1"].tolist()
+    )
+    pools["decimals0"] = pools["token0"].map(decimals)
+    pools["decimals1"] = pools["token1"].map(decimals)
+    pools = pools.dropna(subset=["decimals0", "decimals1"])
     if max_pools > 0:
         pools = pools.head(max_pools)
     contracts = pools["pool"].tolist()
     if not contracts:
-        return pd.DataFrame(), {"source": "uniswap_cryo", "error": "no quote-token pools", "latest": latest, "start": start, "end": end}
+        return pd.DataFrame(), {
+            "source": "uniswap_cryo", "error": "no quote-token pools with resolvable decimals",
+            "latest": latest, "start_block": start, "end_block": end,
+            "pool_scan_start": pool_start, "failed_decimals": len(failed_decimals),
+        }
 
-    _run_cryo(["logs", "--blocks", f"{start}:{end}", "--contract", *contracts, "--topic0", SWAP_TOPIC, "--event-signature", SWAP_SIG, "--hex", "--csv", "--output-dir", str(swaps_dir), "--overwrite", "--inner-request-size", "500"], rpc_url=rpc_url, cwd=root)
-    _run_cryo(["blocks", "--blocks", f"{start}:{end}", "--include-columns", "timestamp", "--csv", "--output-dir", str(blocks_dir), "--overwrite"], rpc_url=rpc_url, cwd=root)
-    swaps = _decode_swaps(_read_csv_tree(swaps_dir), pools, _read_csv_tree(blocks_dir))
+    _run_cryo([
+        "logs", "--blocks", f"{start}:{end}",
+        "--contract", *contracts,
+        "--topic0", SWAP_TOPIC,
+        "--event-signature", SWAP_SIG,
+        "--hex", "--csv", "--output-dir", str(swaps_dir),
+        "--overwrite", "--inner-request-size", "500",
+    ], rpc_url=rpc_url, cwd=root)
+    swaps_raw = _read_csv_tree(swaps_dir)
+    if swaps_raw.empty:
+        return pd.DataFrame(), {
+            "source": "uniswap_cryo", "error": "no Swap rows returned",
+            "latest": latest, "start_block": start, "end_block": end,
+            "pool_scan_start": pool_start, "selected_pools": len(pools),
+        }
+
+    block_numbers = pd.to_numeric(swaps_raw.get("block_number"), errors="coerce").dropna().astype(int).unique().tolist()
+    blocks = _block_timestamps(rpc_url, block_numbers)
+    swaps = _decode_swaps(swaps_raw, pools, blocks)
     panel = _bars(swaps)
     report = {
-        "source": "uniswap_cryo", "latest": latest, "start_block": start, "end_block": end,
-        "pool_scan_start": pool_start, "selected_pools": len(pools), "raw_swaps": len(swaps),
-        "bar_symbols": int(panel["symbol"].nunique()) if len(panel) else 0, "bar_rows": len(panel),
+        "source": "uniswap_cryo",
+        "latest": latest,
+        "canonical_end": canonical_end,
+        "start_block": start,
+        "end_block": end,
+        "end_block_offset": int(end_block_offset),
+        "pool_scan_start": pool_start,
+        "selected_pools": len(pools),
+        "failed_token_decimals": len(failed_decimals),
+        "raw_swap_rows": len(swaps_raw),
+        "decoded_swaps": len(swaps),
+        "timestamped_blocks": len(blocks),
+        "bar_symbols": int(panel["symbol"].nunique()) if len(panel) else 0,
+        "bar_rows": len(panel),
     }
     return panel, report
