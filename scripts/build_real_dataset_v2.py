@@ -30,7 +30,8 @@ def main() -> None:
 
     ap.add_argument("--latoken-days", type=int, default=14)
     ap.add_argument("--latoken-end-offset-days", type=int, default=0)
-    ap.add_argument("--latoken-max-pairs", type=int, default=120, help="0 = all pairs")
+    ap.add_argument("--latoken-pair-offset", type=int, default=0)
+    ap.add_argument("--latoken-max-pairs", type=int, default=120, help="0 = all pairs from offset")
     ap.add_argument("--latoken-workers", type=int, default=10)
     ap.add_argument("--latoken-chunk-hours", type=int, default=72)
 
@@ -53,6 +54,7 @@ def main() -> None:
             lat, rep = collect_latoken_panel(
                 days=args.latoken_days,
                 end_offset_days=args.latoken_end_offset_days,
+                pair_offset=args.latoken_pair_offset,
                 max_pairs=args.latoken_max_pairs,
                 workers=args.latoken_workers,
                 chunk_hours=args.latoken_chunk_hours,
@@ -80,13 +82,12 @@ def main() -> None:
         except Exception as exc:
             reports.append({"source": "uniswap_cryo", "error": repr(exc)})
 
-    # Persist source diagnostics before any merge/min-bars failure. This is
-    # essential for GitHub Actions shards: a failed market period is inspectable.
     pre_report = {
         "sources": reports,
         "requested": {
             "latoken_days": args.latoken_days,
             "latoken_end_offset_days": args.latoken_end_offset_days,
+            "latoken_pair_offset": args.latoken_pair_offset,
             "latoken_max_pairs": args.latoken_max_pairs,
             "uniswap_blocks": args.uniswap_blocks,
             "uniswap_end_block_offset": args.uniswap_end_block_offset,
