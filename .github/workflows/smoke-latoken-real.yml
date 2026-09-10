@@ -1,3 +1,4 @@
+# smoke revision 3: pandas-3 parser fix
 name: Smoke REAL LATOKEN V2
 
 on:
