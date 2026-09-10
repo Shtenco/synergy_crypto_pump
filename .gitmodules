@@ -1,0 +1,45 @@
+[submodule "upstreams/01-borokoko-pump-prediction"]
+	path = upstreams/01-borokoko-pump-prediction
+	url = https://github.com/B0R0koko/pump-and-dump-prediction.git
+[submodule "upstreams/02-bayi-target-coin"]
+	path = upstreams/02-bayi-target-coin
+	url = https://github.com/Bayi-Hu/Pump-and-Dump-Detection-on-Cryptocurrency.git
+[submodule "upstreams/03-chainoba"]
+	path = upstreams/03-chainoba
+	url = https://github.com/cakcora/Chainoba.git
+[submodule "upstreams/04-solana-graduation"]
+	path = upstreams/04-solana-graduation
+	url = https://github.com/baseershah7/Solana_Memecoin_Graduation.git
+[submodule "upstreams/05-solana-memcoin-ensemble"]
+	path = upstreams/05-solana-memcoin-ensemble
+	url = https://github.com/gayatri1505/Solana-Memcoin-Prediction-Using-Machine-Learning.git
+[submodule "upstreams/06-graduate-oracle"]
+	path = upstreams/06-graduate-oracle
+	url = https://github.com/Based-LTD/graduate-oracle.git
+[submodule "upstreams/07-multi-exchange-predictor"]
+	path = upstreams/07-multi-exchange-predictor
+	url = https://github.com/Wendy1890/crypto_pump_predictor_bot.git
+[submodule "upstreams/08-deep-pump-detection"]
+	path = upstreams/08-deep-pump-detection
+	url = https://github.com/Derposoft/crypto_pump_and_dump_with_deep_learning.git
+[submodule "upstreams/09-crypto-anomaly-detection"]
+	path = upstreams/09-crypto-anomaly-detection
+	url = https://github.com/uasth/CryptoAnomalyDetection.git
+[submodule "upstreams/10-crypto-fraud-stgnn"]
+	path = upstreams/10-crypto-fraud-stgnn
+	url = https://github.com/lidialosavio-dotcom/crypto_fraud_stGNN.git
+[submodule "upstreams/11-pumpwatcher"]
+	path = upstreams/11-pumpwatcher
+	url = https://github.com/Confringo233/PumpWatcher.git
+[submodule "upstreams/12-market-social-signal"]
+	path = upstreams/12-market-social-signal
+	url = https://github.com/mfzhang/20260115-Pump_and_Dump_detect_signal.git
+[submodule "upstreams/13-social-dataset"]
+	path = upstreams/13-social-dataset
+	url = https://github.com/Mehrnoom/Cryptocurrency-Pump-Dump.git
+[submodule "upstreams/14-llm-social-momentum"]
+	path = upstreams/14-llm-social-momentum
+	url = https://github.com/lodetomasi/the-intelligent-llm-investor.git
+[submodule "upstreams/15-bayesian-change-point"]
+	path = upstreams/15-bayesian-change-point
+	url = https://github.com/RaibekTussupbekov/binance-pump-dump-detector.git
