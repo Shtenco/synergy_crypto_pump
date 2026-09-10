@@ -26,14 +26,40 @@ def http_json(url: str, *, params: dict[str, Any] | None = None, timeout: int = 
     raise RuntimeError(f"GET failed after {retries} attempts: {url}: {last}")
 
 
-def rpc_json(rpc_url: str, method: str, params: list[Any] | None = None, *, timeout: int = 30) -> Any:
+def rpc_json(
+    rpc_url: str,
+    method: str,
+    params: list[Any] | None = None,
+    *,
+    timeout: int = 30,
+    retries: int = 4,
+) -> Any:
+    """Small retry-safe JSON-RPC client.
+
+    The URL is intentionally omitted from exception text because it can contain
+    provider API keys supplied through repository secrets.
+    """
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()
-    req = urllib.request.Request(rpc_url, data=body, headers={"Content-Type": "application/json", "User-Agent": "crypto-pump-v2/0.3"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        payload = json.loads(r.read().decode("utf-8"))
-    if payload.get("error"):
-        raise RuntimeError(f"RPC {method} failed: {payload['error']}")
-    return payload.get("result")
+    last: Exception | None = None
+    for i in range(max(1, retries)):
+        req = urllib.request.Request(
+            rpc_url,
+            data=body,
+            headers={"Content-Type": "application/json", "User-Agent": "crypto-pump-v2/0.5"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                payload = json.loads(r.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"RPC {method} returned {type(payload).__name__}")
+            if payload.get("error"):
+                raise RuntimeError(f"RPC {method} failed: {payload['error']}")
+            return payload.get("result")
+        except Exception as exc:
+            last = exc
+            if i + 1 < retries:
+                time.sleep(min(8.0, 1.0 * (2 ** i)))
+    raise RuntimeError(f"RPC {method} failed after {retries} attempts: {last}")
 
 
 def write_table(df: pd.DataFrame, path: str | Path) -> Path:
