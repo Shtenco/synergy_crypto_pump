@@ -1,0 +1,103 @@
+name: Probe LATOKEN public trade history
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/probe-latoken-trades.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Probe tag and UUID path variants
+        run: |
+          python - <<'PY'
+          import json, time, urllib.parse, urllib.request, urllib.error
+          from pathlib import Path
+
+          BASE='https://api.latoken.com'
+          def req(path, params=None):
+              u=BASE+path
+              if params:
+                  u += '?' + urllib.parse.urlencode(params)
+              request=urllib.request.Request(u,headers={'Accept':'application/json','User-Agent':'crypto-pump-trade-probe/1'})
+              try:
+                  with urllib.request.urlopen(request,timeout=20) as r:
+                      body=r.read().decode()
+                      try: payload=json.loads(body)
+                      except Exception: payload=body[:1000]
+                      return {'status':r.status,'payload':payload}
+              except urllib.error.HTTPError as e:
+                  body=e.read().decode(errors='replace')
+                  try: payload=json.loads(body)
+                  except Exception: payload=body[:1000]
+                  return {'status':e.code,'payload':payload}
+              except Exception as e:
+                  return {'error':repr(e)}
+
+          currencies=req('/v2/currency').get('payload')
+          by_tag={}
+          if isinstance(currencies,list):
+              for x in currencies:
+                  if isinstance(x,dict):
+                      tag=str(x.get('tag') or '').upper()
+                      cid=str(x.get('id') or '')
+                      if tag and cid: by_tag[tag]=cid
+          elif isinstance(currencies,dict):
+              rows=currencies.get('data') or currencies.get('result') or []
+              if isinstance(rows,list):
+                  for x in rows:
+                      tag=str(x.get('tag') or '').upper(); cid=str(x.get('id') or '')
+                      if tag and cid: by_tag[tag]=cid
+
+          now_ms=int(time.time()*1000)
+          now_s=now_ms//1000
+          pairs=['ETH/USDT','SHIB/USDT','BTC/USDT']
+          out={'currency_ids':{k:by_tag.get(k) for k in ['ETH','SHIB','BTC','USDT']},'probes':[]}
+          for pair in pairs:
+              b,q=pair.split('/')
+              variants=[
+                  ('tags_no_params', f'/v2/trade/history/{b}/{q}', None),
+                  ('tags_limit100', f'/v2/trade/history/{b}/{q}', {'limit':100}),
+                  ('tags_ms', f'/v2/trade/history/{b}/{q}', {'from':now_ms,'limit':100}),
+                  ('tags_s', f'/v2/trade/history/{b}/{q}', {'from':now_s,'limit':100}),
+              ]
+              if by_tag.get(b) and by_tag.get(q):
+                  bp,qp=by_tag[b],by_tag[q]
+                  variants += [
+                      ('uuid_no_params', f'/v2/trade/history/{bp}/{qp}', None),
+                      ('uuid_limit100', f'/v2/trade/history/{bp}/{qp}', {'limit':100}),
+                      ('uuid_ms', f'/v2/trade/history/{bp}/{qp}', {'from':now_ms,'limit':100}),
+                  ]
+              for label,path,params in variants:
+                  r=req(path,params)
+                  payload=r.get('payload')
+                  sample=None; count=None
+                  if isinstance(payload,list):
+                      count=len(payload); sample=payload[0] if payload else None
+                  elif isinstance(payload,dict):
+                      rows=payload.get('data') or payload.get('result') or payload.get('payload')
+                      if isinstance(rows,list): count=len(rows); sample=rows[0] if rows else None
+                      else: sample=payload
+                  out['probes'].append({'pair':pair,'variant':label,'status':r.get('status'),'count':count,'sample':sample,'error':r.get('error')})
+          Path('latoken_trade_probe.json').write_text(json.dumps(out,indent=2),encoding='utf-8')
+          print(json.dumps(out,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: latoken-trade-probe-${{ github.run_id }}
+          path: latoken_trade_probe.json
+          retention-days: 7
