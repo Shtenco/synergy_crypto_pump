@@ -1,0 +1,57 @@
+name: Smoke REAL LATOKEN V2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/smoke-latoken-real.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  latoken-real:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[boosting]'
+      - name: Collect LATOKEN public history
+        run: |
+          python scripts/build_real_dataset_v2.py \
+            --skip-uniswap --latoken-days 14 --latoken-max-pairs 120 --min-bars 600 \
+            --out data/real_v2/panel.parquet \
+            --report artifacts/real_v2/data_report.json
+      - name: Features and labels
+        run: |
+          crypto-pump features-v2 data/real_v2/panel.parquet data/real_v2/features.parquet --benchmark-symbol LATOKEN:BTCUSDT
+          crypto-pump labels-v2 data/real_v2/features.parquet data/real_v2/labeled.parquet
+      - name: Purged OOS
+        run: |
+          crypto-pump walk-forward-v2 data/real_v2/labeled.parquet artifacts/real_v2/oos --n-splits 3 --top-k 10 --model-kind catboost
+      - name: Summarize
+        if: always()
+        run: |
+          python scripts/summarize_real_v2.py || true
+          test ! -f artifacts/real_v2/SUMMARY.md || cat artifacts/real_v2/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latoken-real-v2-${{ github.run_id }}
+          path: |
+            data/real_v2/
+            artifacts/real_v2/
+          if-no-files-found: warn
+          retention-days: 14
