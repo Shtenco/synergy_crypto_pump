@@ -1,0 +1,225 @@
+name: Train LARGE REAL V2 (Uniswap + LATOKEN)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/train-large-v2.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  build-cryo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Restore Cryo build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cryo
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cryo-cli-0.3.2-${{ runner.os }}
+      - name: Build Cryo once
+        run: |
+          if [ ! -x "$HOME/.cargo/bin/cryo" ]; then
+            cargo install cryo_cli --version 0.3.2 --locked || cargo install cryo_cli
+          fi
+          cryo --version
+          mkdir -p cryo-bin
+          cp "$HOME/.cargo/bin/cryo" cryo-bin/cryo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cryo-linux-x86_64
+          path: cryo-bin/cryo
+          retention-days: 7
+
+  latoken-shards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        end_offset_days: [0, 15]
+        pair_offset: [0, 200, 400, 600, 800, 1000]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install lightweight collector stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - name: Collect 15-day LATOKEN shard
+        id: collect
+        continue-on-error: true
+        run: |
+          mkdir -p shard
+          python scripts/build_real_dataset_v2.py \
+            --skip-uniswap \
+            --latoken-days 15 \
+            --latoken-end-offset-days "${{ matrix.end_offset_days }}" \
+            --latoken-pair-offset "${{ matrix.pair_offset }}" \
+            --latoken-max-pairs 200 \
+            --latoken-chunk-hours 24 \
+            --latoken-workers 4 \
+            --min-bars 1 \
+            --out shard/panel.parquet \
+            --report shard/report.json
+      - name: Shard status
+        if: always()
+        run: |
+          test ! -f shard/report.json || cat shard/report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: latoken-large-t${{ matrix.end_offset_days }}-p${{ matrix.pair_offset }}
+          path: shard/
+          if-no-files-found: warn
+          retention-days: 14
+
+  uniswap-shards:
+    needs: build-cryo
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ETH_RPC_URL: ${{ secrets.ETH_RPC_URL }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        block_offset: [0, 250000, 500000, 750000, 1000000, 1250000]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install lightweight collector stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - uses: actions/download-artifact@v4
+        with:
+          name: cryo-linux-x86_64
+          path: "$HOME/.local/bin"
+      - name: Enable Cryo and RPC
+        run: |
+          chmod +x "$HOME/.local/bin/cryo"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [ -z "$ETH_RPC_URL" ]; then
+            echo "ETH_RPC_URL=https://eth.llamarpc.com" >> "$GITHUB_ENV"
+          fi
+          "$HOME/.local/bin/cryo" --version
+      - name: Collect 250k-block Uniswap V3 shard
+        id: collect
+        continue-on-error: true
+        run: |
+          mkdir -p shard
+          python scripts/build_real_dataset_v2.py \
+            --skip-latoken \
+            --uniswap-blocks 250000 \
+            --uniswap-end-block-offset "${{ matrix.block_offset }}" \
+            --uniswap-pool-lookback-blocks 1500000 \
+            --uniswap-max-pools 300 \
+            --min-bars 1 \
+            --out shard/panel.parquet \
+            --report shard/report.json
+      - name: Shard status
+        if: always()
+        run: |
+          test ! -f shard/report.json || cat shard/report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uniswap-large-b${{ matrix.block_offset }}
+          path: shard/
+          if-no-files-found: warn
+          retention-days: 14
+
+  train-large-v2:
+    needs: [latoken-shards, uniswap-shards]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install training stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install 'catboost>=1.2'
+      - name: Download LATOKEN shards
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: latoken-large-*
+          path: downloaded/latoken
+      - name: Download Uniswap shards
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: uniswap-large-*
+          path: downloaded/uniswap
+      - name: Merge only contiguous 5-minute histories
+        run: |
+          python scripts/merge_real_shards.py downloaded \
+            --min-bars 600 \
+            --out data/real_v2/panel.parquet \
+            --report artifacts/real_v2/data_report.json
+      - name: Build causal V2 features
+        run: |
+          crypto-pump features-v2 \
+            data/real_v2/panel.parquet \
+            data/real_v2/features.parquet \
+            --benchmark-symbol LATOKEN:BTCUSDT
+      - name: Build strict +10/+20/+50/+100 targets
+        run: |
+          crypto-pump labels-v2 \
+            data/real_v2/features.parquet \
+            data/real_v2/labeled.parquet
+      - name: Purged walk-forward OOS CatBoost + YetiRank
+        run: |
+          crypto-pump walk-forward-v2 \
+            data/real_v2/labeled.parquet \
+            artifacts/real_v2/oos \
+            --n-splits 2 \
+            --top-k 10 \
+            --model-kind catboost
+      - name: Fit final V2 model
+        run: |
+          mkdir -p artifacts/real_v2/model
+          crypto-pump train-v2 \
+            data/real_v2/labeled.parquet \
+            artifacts/real_v2/model/crypto_pump_v2_large.joblib \
+            --model-kind catboost
+      - name: Summarize real large run
+        if: always()
+        run: |
+          python scripts/summarize_real_v2.py || true
+          test ! -f artifacts/real_v2/SUMMARY.md || cat artifacts/real_v2/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload large dataset, OOS and final model
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-pump-v2-large-${{ github.run_id }}
+          path: |
+            data/real_v2/
+            artifacts/real_v2/
+          if-no-files-found: warn
+          retention-days: 30
