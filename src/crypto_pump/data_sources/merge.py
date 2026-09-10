@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 REQUIRED = ["timestamp", "symbol", "open", "high", "low", "close", "volume"]
+ZERO_FLOW_COLUMNS = {"volume", "quote_volume", "trades", "buy_volume", "sell_volume"}
 
 
 def _regularize_one(p: pd.DataFrame, freq: str) -> pd.DataFrame:
@@ -14,19 +15,28 @@ def _regularize_one(p: pd.DataFrame, freq: str) -> pd.DataFrame:
     idx = pd.date_range(p.index.min(), p.index.max(), freq=freq, tz="UTC")
     p = p.reindex(idx)
     p.index.name = "timestamp"
-    close = p["close"].ffill()
+
+    # Price is carried forward only. Never backward-fill from a future trade/bar.
+    close = pd.to_numeric(p["close"], errors="coerce").ffill()
     for c in ("open", "high", "low", "close"):
-        p[c] = p[c].fillna(close)
-    for c in ("volume", "quote_volume", "trades", "buy_volume", "sell_volume"):
+        p[c] = pd.to_numeric(p[c], errors="coerce").fillna(close)
+
+    # No activity in a missing interval means zero flow, not unknown future flow.
+    for c in ZERO_FLOW_COLUMNS:
         if c in p:
             p[c] = pd.to_numeric(p[c], errors="coerce").fillna(0.0)
+
+    # State/metadata may persist from its last observation, but must never be
+    # backward-filled because that leaks future pool state into earlier bars.
     for c in p.columns:
-        if c not in {"open", "high", "low", "close", "volume", "quote_volume", "trades", "buy_volume", "sell_volume"}:
-            p[c] = p[c].ffill().bfill()
+        if c not in {"open", "high", "low", "close", *ZERO_FLOW_COLUMNS}:
+            p[c] = p[c].ffill()
     return p.reset_index()
 
 
-def merge_and_regularize_panels(panels: list[pd.DataFrame], *, freq: str = "5min", min_bars: int = 600) -> pd.DataFrame:
+def merge_and_regularize_panels(
+    panels: list[pd.DataFrame], *, freq: str = "5min", min_bars: int = 600
+) -> pd.DataFrame:
     good = [p.copy() for p in panels if p is not None and len(p)]
     if not good:
         raise ValueError("no source returned market bars")
@@ -42,7 +52,8 @@ def merge_and_regularize_panels(panels: list[pd.DataFrame], *, freq: str = "5min
             q["symbol"] = symbol
             parts.append(q)
     if not parts:
-        raise ValueError(f"no symbols survive min_bars={min_bars}")
+        counts = df.groupby("symbol")["timestamp"].nunique().sort_values(ascending=False).head(20).to_dict()
+        raise ValueError(f"no symbols survive min_bars={min_bars}; top observed bar counts={counts}")
     out = pd.concat(parts, ignore_index=True, sort=False)
     out = out.dropna(subset=["open", "high", "low", "close"])
     return out.sort_values(["symbol", "timestamp"], kind="mergesort").reset_index(drop=True)
