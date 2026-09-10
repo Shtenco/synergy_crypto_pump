@@ -37,8 +37,12 @@ def _rpc_candidates() -> list[tuple[str, str]]:
             if url:
                 candidates.append((f"env_fallback_{i + 1}", url))
 
-    # Keyless public fallbacks. They are deliberately after a user-supplied RPC.
+    # Keyless/public fallbacks documented by their providers. GitHub-hosted
+    # runner egress is provider-dependent, so keep several independent networks.
     candidates.extend([
+        ("drpc_public", "https://eth.drpc.org/"),
+        ("envio_hyperrpc", "https://eth.rpc.hypersync.xyz"),
+        ("cloudflare", "https://cloudflare-eth.com/v1/mainnet"),
         ("publicnode", "https://ethereum-rpc.publicnode.com"),
         ("1rpc", "https://public.1rpc.io/eth"),
         ("llamarpc", "https://eth.llamarpc.com"),
