@@ -1,0 +1,72 @@
+name: Probe Ethereum historical log backends
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/probe-ethereum-rpc.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Probe blockNumber and Uniswap Factory logs
+        run: |
+          python - <<'PY'
+          import json, urllib.request, urllib.error
+          from pathlib import Path
+
+          endpoints = {
+              'drpc_public': 'https://eth.drpc.org/',
+              'envio_hyperrpc': 'https://eth.rpc.hypersync.xyz',
+              'cloudflare': 'https://cloudflare-eth.com/v1/mainnet',
+              'publicnode': 'https://ethereum-rpc.publicnode.com',
+              '1rpc': 'https://public.1rpc.io/eth',
+              'llamarpc': 'https://eth.llamarpc.com',
+          }
+          factory='0x1f98431c8ad98523631ae4a59f267346ea31f984'
+          topic='0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118'
+
+          def call(url, method, params):
+              body=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+              req=urllib.request.Request(url,data=body,headers={'Content-Type':'application/json','User-Agent':'crypto-pump-rpc-probe/1'})
+              with urllib.request.urlopen(req,timeout=15) as r:
+                  x=json.loads(r.read().decode())
+              if x.get('error'):
+                  raise RuntimeError(str(x['error']))
+              return x.get('result')
+
+          out={}
+          for name,url in endpoints.items():
+              row={}
+              try:
+                  head=int(call(url,'eth_blockNumber',[]),16)
+                  row['head']=head
+                  a=max(12369621, head-100)
+                  logs=call(url,'eth_getLogs',[{'fromBlock':hex(a),'toBlock':hex(head),'address':factory,'topics':[topic]}])
+                  row['logs_ok']=True
+                  row['logs_count']=len(logs or [])
+              except Exception as e:
+                  row['logs_ok']=False
+                  row['error']=repr(e)[:500]
+              out[name]=row
+          Path('rpc_probe.json').write_text(json.dumps(out,indent=2),encoding='utf-8')
+          print(json.dumps(out,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ethereum-rpc-probe-${{ github.run_id }}
+          path: rpc_probe.json
+          retention-days: 7
