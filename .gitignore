@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Data / models
+data/
+artifacts/
+*.parquet
+*.joblib
+*.pkl
+
+# Third-party research checkouts
+external/upstreams/
+upstreams.lock.json
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

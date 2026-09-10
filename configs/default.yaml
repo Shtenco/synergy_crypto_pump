@@ -1,0 +1,18 @@
+features:
+  windows: [3, 6, 12, 24, 48]
+  z_window: 48
+labels:
+  horizon: 12
+  pump_threshold: 0.20
+  dump_threshold: -0.15
+model:
+  kind: auto
+  random_state: 42
+  top_k: 20
+split:
+  train_fraction: 0.70
+  validation_fraction: 0.15
+execution_assumptions:
+  fee_bps: 10
+  slippage_bps: 25
+  latency_bars: 1
