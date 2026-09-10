@@ -57,6 +57,16 @@ def _int_word(w: str, bits: int = 256) -> int:
     return u - (1 << bits) if u >= (1 << (bits - 1)) else u
 
 
+def _hex_int(x: Any, default: int = 0) -> int:
+    if x is None:
+        return default
+    try:
+        s = str(x)
+        return int(s, 16) if s.startswith("0x") else int(s)
+    except Exception:
+        return default
+
+
 def _read_csv_tree(root: Path) -> pd.DataFrame:
     parts = []
     for f in sorted(root.rglob("*.csv")):
@@ -70,6 +80,11 @@ def _read_csv_tree(root: Path) -> pd.DataFrame:
 
 
 def _run_cryo(args: list[str], *, rpc_url: str, cwd: Path) -> None:
+    """Optional Cryo accelerator retained for research/debugging.
+
+    Production public-RPC collection below uses adaptive direct eth_getLogs,
+    because public providers frequently reject Cryo's large batched log scans.
+    """
     cmd = [
         "cryo", *args,
         "--rpc", rpc_url,
@@ -81,6 +96,92 @@ def _run_cryo(args: list[str], *, rpc_url: str, cwd: Path) -> None:
     if proc.returncode:
         tail = (proc.stdout or "")[-6000:]
         raise RuntimeError(f"Cryo failed ({proc.returncode}): {' '.join(cmd[:8])}\n{tail}")
+
+
+def _raw_log_row(log: dict[str, Any]) -> dict[str, Any]:
+    topics = list(log.get("topics") or [])
+    return {
+        "block_number": _hex_int(log.get("blockNumber")),
+        "transaction_index": _hex_int(log.get("transactionIndex")),
+        "log_index": _hex_int(log.get("logIndex")),
+        "address": str(log.get("address") or "").lower(),
+        "topic0": topics[0] if len(topics) > 0 else None,
+        "topic1": topics[1] if len(topics) > 1 else None,
+        "topic2": topics[2] if len(topics) > 2 else None,
+        "topic3": topics[3] if len(topics) > 3 else None,
+        "data": log.get("data") or "0x",
+    }
+
+
+def _get_logs_recursive(
+    rpc_url: str,
+    start: int,
+    end: int,
+    addresses: list[str],
+    topic0: str,
+    *,
+    timeout: int = 60,
+) -> list[dict[str, Any]]:
+    """Fetch logs and recursively split requests rejected by provider limits."""
+    if end < start or not addresses:
+        return []
+    filt: dict[str, Any] = {
+        "fromBlock": hex(int(start)),
+        "toBlock": hex(int(end)),
+        "address": addresses[0] if len(addresses) == 1 else addresses,
+        "topics": [topic0],
+    }
+    try:
+        result = rpc_json(rpc_url, "eth_getLogs", [filt], timeout=timeout, retries=2)
+        if result is None:
+            return []
+        if not isinstance(result, list):
+            raise RuntimeError(f"eth_getLogs returned {type(result).__name__}")
+        return [x for x in result if isinstance(x, dict)]
+    except Exception:
+        # Prefer splitting the block span first: most public RPC limits are
+        # expressed as max block range / response size. If one block still
+        # fails, split the address list. Never silently drop a request.
+        if start < end:
+            mid = (start + end) // 2
+            return (
+                _get_logs_recursive(rpc_url, start, mid, addresses, topic0, timeout=timeout)
+                + _get_logs_recursive(rpc_url, mid + 1, end, addresses, topic0, timeout=timeout)
+            )
+        if len(addresses) > 1:
+            mid = len(addresses) // 2
+            return (
+                _get_logs_recursive(rpc_url, start, end, addresses[:mid], topic0, timeout=timeout)
+                + _get_logs_recursive(rpc_url, start, end, addresses[mid:], topic0, timeout=timeout)
+            )
+        raise
+
+
+def _collect_logs_adaptive(
+    rpc_url: str,
+    *,
+    start: int,
+    end: int,
+    addresses: list[str],
+    topic0: str,
+    block_chunk: int = 2_000,
+    address_batch: int = 25,
+) -> pd.DataFrame:
+    """Bound request sizes up-front, then recursively shrink on RPC rejection."""
+    rows: list[dict[str, Any]] = []
+    unique_addresses = sorted({a.lower() for a in addresses if a})
+    for ai in range(0, len(unique_addresses), max(1, address_batch)):
+        addr_chunk = unique_addresses[ai:ai + max(1, address_batch)]
+        cur = int(start)
+        while cur <= int(end):
+            stop = min(int(end), cur + max(1, block_chunk) - 1)
+            logs = _get_logs_recursive(rpc_url, cur, stop, addr_chunk, topic0)
+            rows.extend(_raw_log_row(x) for x in logs)
+            cur = stop + 1
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    return out.drop_duplicates(["block_number", "transaction_index", "log_index", "address"], keep="last")
 
 
 def _decode_pools(raw: pd.DataFrame) -> pd.DataFrame:
@@ -121,13 +222,13 @@ def _rpc_batch(rpc_url: str, calls: list[tuple[str, list[Any]]], *, timeout: int
         for i, (method, params) in enumerate(calls)
     ]
     data = json.dumps(body).encode()
-    req = urllib.request.Request(
-        rpc_url,
-        data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "crypto-pump-v2/0.4"},
-    )
     last: Exception | None = None
     for attempt in range(retries):
+        req = urllib.request.Request(
+            rpc_url,
+            data=data,
+            headers={"Content-Type": "application/json", "User-Agent": "crypto-pump-v2/0.5"},
+        )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 payload = json.loads(r.read().decode("utf-8"))
@@ -178,7 +279,17 @@ def _block_timestamps(rpc_url: str, block_numbers: list[int], batch_size: int = 
     for i in range(0, len(nums), batch_size):
         chunk = nums[i:i + batch_size]
         calls = [("eth_getBlockByNumber", [hex(n), False]) for n in chunk]
-        results = _rpc_batch(rpc_url, calls, timeout=90, retries=5)
+        try:
+            results = _rpc_batch(rpc_url, calls, timeout=90, retries=5)
+        except Exception:
+            # Some public providers reject JSON-RPC batches. Preserve correctness
+            # by falling back to single retry-safe calls rather than dropping time.
+            results = []
+            for n in chunk:
+                try:
+                    results.append(rpc_json(rpc_url, "eth_getBlockByNumber", [hex(n), False], timeout=60, retries=4))
+                except Exception:
+                    results.append(None)
         for n, block in zip(chunk, results):
             if isinstance(block, dict) and block.get("timestamp"):
                 rows.append({"block_number": n, "timestamp": int(block["timestamp"], 16)})
@@ -214,7 +325,6 @@ def _decode_swaps(raw: pd.DataFrame, pools: pd.DataFrame, blocks: pd.DataFrame) 
 
             if t1 in QUOTES and t0 not in QUOTES:
                 quote, qdec = QUOTES[t1]
-                # sqrtPrice is raw token1/token0. Convert to human quote/token.
                 price = raw_ratio_1_per_0 * (10.0 ** (d0 - d1))
                 token_amt, quote_amt = amount0, amount1
                 token_addr = t0
@@ -278,8 +388,6 @@ def _bars(swaps: pd.DataFrame, min_swaps: int = 20) -> pd.DataFrame:
         token=("token", "first"),
         quote=("quote", "first"),
     ).reset_index().rename(columns={"bar": "timestamp"})
-    # The common OHLCV volume field is a token-unit proxy. quote_volume is the
-    # economically comparable field used cross-sectionally.
     bars["volume"] = bars["quote_volume"] / bars["close"].replace(0.0, np.nan)
     bars["volume"] = bars["volume"].fillna(0.0)
     bars["source"] = "uniswap"
@@ -296,14 +404,14 @@ def collect_uniswap_v3_panel(
     safe_blocks: int = 64,
     workdir: str | Path | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Collect one historical Uniswap V3 shard with Cryo.
+    """Collect one historical Uniswap V3 shard with adaptive direct JSON-RPC.
 
-    `end_block_offset` permits non-overlapping GitHub Actions matrix shards.
-    Pool discovery looks farther back than the swap shard so pools created before
-    the shard boundary are still eligible. Unknown token decimals are fetched
-    on-chain before price conversion; pools with unresolved decimals are dropped.
+    Pool discovery and Swap retrieval are chunked and recursively split when a
+    public RPC rejects a block/address range. `end_block_offset` permits
+    non-overlapping GitHub Actions shards. Token decimals are fetched on-chain
+    before converting sqrtPriceX96 to human quote/token prices.
     """
-    latest_hex = rpc_json(rpc_url, "eth_blockNumber")
+    latest_hex = rpc_json(rpc_url, "eth_blockNumber", timeout=30, retries=4)
     latest = int(latest_hex, 16)
     canonical_end = max(1, latest - safe_blocks)
     end = max(12_369_622, canonical_end - max(0, end_block_offset))
@@ -311,25 +419,23 @@ def collect_uniswap_v3_panel(
     pool_span = int(pool_lookback_blocks or max(lookback_blocks * 6, 500_000))
     pool_start = max(12_369_621, end - pool_span)
 
-    root = Path(workdir or tempfile.mkdtemp(prefix="crypto-pump-cryo-"))
+    root = Path(workdir or tempfile.mkdtemp(prefix="crypto-pump-uniswap-"))
     root.mkdir(parents=True, exist_ok=True)
-    pools_dir, swaps_dir = root / "pools", root / "swaps"
-    for p in (pools_dir, swaps_dir):
-        p.mkdir(parents=True, exist_ok=True)
 
-    _run_cryo([
-        "logs", "--blocks", f"{pool_start}:{end}",
-        "--contract", UNISWAP_V3_FACTORY,
-        "--topic0", POOL_CREATED_TOPIC,
-        "--event-signature", POOL_CREATED_SIG,
-        "--hex", "--csv", "--output-dir", str(pools_dir),
-        "--overwrite", "--inner-request-size", "1000",
-    ], rpc_url=rpc_url, cwd=root)
-    pools_raw = _read_csv_tree(pools_dir)
+    pools_raw = _collect_logs_adaptive(
+        rpc_url,
+        start=pool_start,
+        end=end,
+        addresses=[UNISWAP_V3_FACTORY],
+        topic0=POOL_CREATED_TOPIC,
+        block_chunk=2_000,
+        address_batch=1,
+    )
     pools = _decode_pools(pools_raw)
     if pools.empty:
         return pd.DataFrame(), {
             "source": "uniswap_cryo", "error": "no PoolCreated rows decoded",
+            "collector_mode": "direct_eth_getLogs_adaptive",
             "latest": latest, "start_block": start, "end_block": end,
             "pool_scan_start": pool_start, "pool_raw_rows": len(pools_raw),
         }
@@ -348,24 +454,27 @@ def collect_uniswap_v3_panel(
     if not contracts:
         return pd.DataFrame(), {
             "source": "uniswap_cryo", "error": "no quote-token pools with resolvable decimals",
+            "collector_mode": "direct_eth_getLogs_adaptive",
             "latest": latest, "start_block": start, "end_block": end,
             "pool_scan_start": pool_start, "failed_decimals": len(failed_decimals),
         }
 
-    _run_cryo([
-        "logs", "--blocks", f"{start}:{end}",
-        "--contract", *contracts,
-        "--topic0", SWAP_TOPIC,
-        "--event-signature", SWAP_SIG,
-        "--hex", "--csv", "--output-dir", str(swaps_dir),
-        "--overwrite", "--inner-request-size", "500",
-    ], rpc_url=rpc_url, cwd=root)
-    swaps_raw = _read_csv_tree(swaps_dir)
+    swaps_raw = _collect_logs_adaptive(
+        rpc_url,
+        start=start,
+        end=end,
+        addresses=contracts,
+        topic0=SWAP_TOPIC,
+        block_chunk=2_000,
+        address_batch=25,
+    )
     if swaps_raw.empty:
         return pd.DataFrame(), {
             "source": "uniswap_cryo", "error": "no Swap rows returned",
+            "collector_mode": "direct_eth_getLogs_adaptive",
             "latest": latest, "start_block": start, "end_block": end,
             "pool_scan_start": pool_start, "selected_pools": len(pools),
+            "pool_raw_rows": len(pools_raw),
         }
 
     block_numbers = pd.to_numeric(swaps_raw.get("block_number"), errors="coerce").dropna().astype(int).unique().tolist()
@@ -374,12 +483,14 @@ def collect_uniswap_v3_panel(
     panel = _bars(swaps)
     report = {
         "source": "uniswap_cryo",
+        "collector_mode": "direct_eth_getLogs_adaptive",
         "latest": latest,
         "canonical_end": canonical_end,
         "start_block": start,
         "end_block": end,
         "end_block_offset": int(end_block_offset),
         "pool_scan_start": pool_start,
+        "pool_raw_rows": len(pools_raw),
         "selected_pools": len(pools),
         "failed_token_decimals": len(failed_decimals),
         "raw_swap_rows": len(swaps_raw),
