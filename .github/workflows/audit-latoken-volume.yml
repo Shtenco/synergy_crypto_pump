@@ -1,0 +1,85 @@
+name: Audit LATOKEN candle volume semantics
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/audit-latoken-volume.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  audit-volume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compare TradingView v with public trade quantity and cost
+        run: |
+          python - <<'PY'
+          import json, time, urllib.parse, urllib.request
+          from pathlib import Path
+
+          BASE='https://api.latoken.com'
+          def get(path, params=None):
+              u=BASE+path
+              if params:
+                  u += '?' + urllib.parse.urlencode(params)
+              req=urllib.request.Request(u,headers={'Accept':'application/json','User-Agent':'crypto-pump-volume-audit/1'})
+              with urllib.request.urlopen(req,timeout=30) as r:
+                  return json.loads(r.read().decode())
+
+          now=int(time.time())
+          candles=get('/v2/tradingview/history', {'symbol':'BTC/USDT','resolution':'1m','from':now-1800,'to':now-120})
+          ts=candles.get('t') or []
+          vs=candles.get('v') or []
+          cs=candles.get('c') or []
+          rows=[]
+          for t,v,c in zip(ts[-5:],vs[-5:],cs[-5:]):
+              start_ms=int(t)*1000
+              end_ms=start_ms+60000
+              # API docs: trades before `from` are returned; request at minute end
+              trades=get('/v2/trade/history/BTC/USDT', {'from':end_ms,'limit':1000})
+              if isinstance(trades,dict):
+                  trades=[trades]
+              minute=[x for x in (trades or []) if start_ms <= int(x.get('timestamp') or 0) < end_ms]
+              qty=sum(float(x.get('quantity') or 0) for x in minute)
+              cost=sum(float(x.get('cost') or 0) for x in minute)
+              vv=float(v)
+              close=float(c)
+              rows.append({
+                  'timestamp_s':int(t),'candle_v':vv,'close':close,'trades':len(minute),
+                  'sum_quantity_base':qty,'sum_cost_quote':cost,
+                  'v_over_base': vv/qty if qty else None,
+                  'v_over_quote': vv/cost if cost else None,
+                  'v_times_close_over_quote': vv*close/cost if cost else None,
+                  'v_div_close_over_base': vv/close/qty if qty and close else None,
+              })
+          # Choose the unit only when at least one minute has trade coverage and a clear near-1 ratio.
+          scores={'base':[],'quote':[]}
+          for r in rows:
+              if r['trades']:
+                  if r['v_over_base'] is not None: scores['base'].append(abs(r['v_over_base']-1))
+                  if r['v_over_quote'] is not None: scores['quote'].append(abs(r['v_over_quote']-1))
+          med={k:(sorted(v)[len(v)//2] if v else None) for k,v in scores.items()}
+          interpretation='unresolved'
+          if med['base'] is not None and med['quote'] is not None:
+              if med['base'] < 0.15 and med['base'] < med['quote']/3: interpretation='base_volume'
+              elif med['quote'] < 0.15 and med['quote'] < med['base']/3: interpretation='quote_volume'
+          out={'pair':'BTC/USDT','rows':rows,'median_abs_ratio_error':med,'interpretation':interpretation}
+          Path('latoken_volume_audit.json').write_text(json.dumps(out,indent=2),encoding='utf-8')
+          print(json.dumps(out,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: latoken-volume-audit-${{ github.run_id }}
+          path: latoken_volume_audit.json
+          retention-days: 30
