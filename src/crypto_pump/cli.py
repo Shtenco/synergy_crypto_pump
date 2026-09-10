@@ -139,8 +139,9 @@ def train_v2(
     cut = max(1, int(len(times) * (1.0 - validation_fraction)))
     train_times, val_times = set(times[:cut]), set(times[cut:])
     purge = 288
-    if cut > purge:
-        train_times = set(times[: cut - purge])
+    if cut <= purge:
+        raise ValueError("train-v2 requires more than 288 pre-validation timestamps for the 24h target purge")
+    train_times = set(times[: cut - purge])
     ts = pd.to_datetime(df["timestamp"], utc=True)
     train_df = df[ts.isin(train_times)]
     val_df = df[ts.isin(val_times)]
@@ -171,15 +172,18 @@ def rank_v2(
     """Score/rank the universe with a fitted V2 ensemble."""
     from .v2.pipeline import V2Ensemble
     df = read_table(source)
-    if latest_only:
-        latest = pd.to_datetime(df["timestamp"], utc=True).max()
-        df = df[pd.to_datetime(df["timestamp"], utc=True) == latest].copy()
     tx = read_table(transactions) if transactions is not None else None
     model = V2Ensemble.load(model_path)
+    # Keep historical context while scoring so the causal Transformer can build
+    # its sequence ending at the latest row; filter only after prediction.
     pred = model.predict(df, tx)
     out = pd.concat([df[["timestamp", "symbol"]], pred], axis=1)
+    if latest_only:
+        latest = pd.to_datetime(out["timestamp"], utc=True).max()
+        out = out[pd.to_datetime(out["timestamp"], utc=True) == latest].copy()
     for col in [c for c in pred if c.startswith("pump_probability__")]:
-        out[f"rank__{col}"] = out.groupby("timestamp")[col].rank(method="first", ascending=False)
+        if col in out:
+            out[f"rank__{col}"] = out.groupby("timestamp")[col].rank(method="first", ascending=False)
     write_table(out, destination)
 
 
