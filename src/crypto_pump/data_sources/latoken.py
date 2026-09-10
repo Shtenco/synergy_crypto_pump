@@ -65,8 +65,6 @@ def _pair_universe(quote: str = "USDT") -> list[tuple[str, str]]:
         quote_raw = r.get("quoteCurrency") or r.get("quote") or r.get("quoteAsset")
         base = _resolve_currency(base_raw, by_id)
         q = _resolve_currency(quote_raw, by_id)
-        # Some /v2/pair rows reference currencies no longer returned by
-        # /v2/currency. A raw UUID cannot be used as TradingView symbol.
         if _looks_unresolved_uuid(base) or _looks_unresolved_uuid(q):
             continue
         if base and q == quote.upper() and base != q:
@@ -165,18 +163,26 @@ def collect_latoken_panel(
     *,
     days: int = 14,
     max_pairs: int = 120,
+    pair_offset: int = 0,
     quote: str = "USDT",
     end: datetime | None = None,
     end_offset_days: int = 0,
     workers: int = 10,
     chunk_hours: int = 72,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Collect LATOKEN 1-minute public candles and aggregate causally to 5m."""
+    """Collect LATOKEN 1-minute public candles and aggregate causally to 5m.
+
+    `pair_offset` + `max_pairs` allows GitHub Actions to cover the full pair
+    universe without multiplying the same symbols across workers. `max_pairs=0`
+    means all pairs from the offset onward.
+    """
     anchor = end or datetime.now(timezone.utc)
     end = (anchor - timedelta(days=max(0, end_offset_days))).replace(second=0, microsecond=0)
     start = end - timedelta(days=max(1, days))
-    pairs = _pair_universe(quote=quote)
-    universe_pairs = len(pairs)
+    all_pairs = _pair_universe(quote=quote)
+    universe_pairs = len(all_pairs)
+    offset = max(0, int(pair_offset))
+    pairs = all_pairs[offset:]
     if max_pairs > 0:
         pairs = pairs[:max_pairs]
 
@@ -224,6 +230,7 @@ def collect_latoken_panel(
         "resolution_raw": "1m",
         "resolution_output": "5m",
         "universe_pairs": universe_pairs,
+        "pair_offset": offset,
         "requested_pairs": len(pairs),
         "successful_pairs": int(panel["symbol"].nunique()) if len(panel) else 0,
         "minute_rows": int(minute_rows),
