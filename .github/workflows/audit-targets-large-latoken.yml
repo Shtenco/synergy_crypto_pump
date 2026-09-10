@@ -1,0 +1,82 @@
+name: Audit LARGE LATOKEN targets
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/audit-targets-large-latoken.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SOURCE_RUN_ID: "34525317429"
+
+jobs:
+  target-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - name: Download immutable LATOKEN shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: latoken-large-*
+          path: downloaded/latoken
+          github-token: ${{ github.token }}
+          repository: Shtenco/crypto_pump
+          run-id: ${{ env.SOURCE_RUN_ID }}
+      - name: Merge, causal features and strict targets
+        run: |
+          python scripts/merge_real_shards.py downloaded/latoken \
+            --min-bars 600 \
+            --out data/audit/panel.parquet \
+            --report artifacts/audit/data_report.json
+          crypto-pump features-v2 data/audit/panel.parquet data/audit/features.parquet --benchmark-symbol LATOKEN:BTCUSDT
+          crypto-pump labels-v2 data/audit/features.parquet data/audit/labeled.parquet
+      - name: Write target audit
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          d = pd.read_parquet('data/audit/labeled.parquet')
+          report = {
+              'rows': int(len(d)),
+              'symbols': int(d['symbol'].nunique()),
+              'timestamps': int(pd.to_datetime(d['timestamp'], utc=True).nunique()),
+              'timestamp_min': str(d['timestamp'].min()),
+              'timestamp_max': str(d['timestamp'].max()),
+              'numeric_columns': int(len(d.select_dtypes(include='number').columns)),
+              'targets': {},
+          }
+          for c in sorted(x for x in d.columns if x.startswith('target__')):
+              x = pd.to_numeric(d[c], errors='coerce').dropna()
+              pos = int(x.sum())
+              report['targets'][c] = {
+                  'labeled_rows': int(len(x)),
+                  'censored_rows': int(len(d) - len(x)),
+                  'positives': pos,
+                  'negatives': int(len(x) - pos),
+                  'positive_rate': float(x.mean()) if len(x) else None,
+              }
+          Path('artifacts/audit/target_report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+          print(json.dumps(report, indent=2))
+          PY
+          cat artifacts/audit/target_report.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: latoken-large-target-audit-${{ github.run_id }}
+          path: |
+            artifacts/audit/data_report.json
+            artifacts/audit/target_report.json
+          retention-days: 30
