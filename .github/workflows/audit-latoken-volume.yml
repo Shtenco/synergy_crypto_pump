@@ -29,52 +29,84 @@ jobs:
           from pathlib import Path
 
           BASE='https://api.latoken.com'
+          CANDIDATES=['ETH/USDT','SHIB/USDT','HBAR/USDT','RACA/USDT','ANKR/USDT','ICP/USDT','W/USDT','SLP/USDT','GNO/USDT','BTC/USDT']
+
           def get(path, params=None):
               u=BASE+path
               if params:
                   u += '?' + urllib.parse.urlencode(params)
-              req=urllib.request.Request(u,headers={'Accept':'application/json','User-Agent':'crypto-pump-volume-audit/1'})
+              req=urllib.request.Request(u,headers={'Accept':'application/json','User-Agent':'crypto-pump-volume-audit/2'})
               with urllib.request.urlopen(req,timeout=30) as r:
                   return json.loads(r.read().decode())
 
           now=int(time.time())
-          candles=get('/v2/tradingview/history', {'symbol':'BTC/USDT','resolution':'1m','from':now-1800,'to':now-120})
-          ts=candles.get('t') or []
-          vs=candles.get('v') or []
-          cs=candles.get('c') or []
-          rows=[]
-          for t,v,c in zip(ts[-5:],vs[-5:],cs[-5:]):
-              start_ms=int(t)*1000
-              end_ms=start_ms+60000
-              # API docs: trades before `from` are returned; request at minute end
-              trades=get('/v2/trade/history/BTC/USDT', {'from':end_ms,'limit':1000})
-              if isinstance(trades,dict):
-                  trades=[trades]
-              minute=[x for x in (trades or []) if start_ms <= int(x.get('timestamp') or 0) < end_ms]
-              qty=sum(float(x.get('quantity') or 0) for x in minute)
-              cost=sum(float(x.get('cost') or 0) for x in minute)
-              vv=float(v)
-              close=float(c)
-              rows.append({
-                  'timestamp_s':int(t),'candle_v':vv,'close':close,'trades':len(minute),
-                  'sum_quantity_base':qty,'sum_cost_quote':cost,
-                  'v_over_base': vv/qty if qty else None,
-                  'v_over_quote': vv/cost if cost else None,
-                  'v_times_close_over_quote': vv*close/cost if cost else None,
-                  'v_div_close_over_base': vv/close/qty if qty and close else None,
-              })
-          # Choose the unit only when at least one minute has trade coverage and a clear near-1 ratio.
+          observations=[]
+          diagnostics={}
+          for pair in CANDIDATES:
+              try:
+                  candles=get('/v2/tradingview/history', {
+                      'symbol':pair,'resolution':'1m','from':now-86400,'to':now-120
+                  })
+                  diagnostics[pair]={'status':candles.get('s') if isinstance(candles,dict) else None}
+                  if not isinstance(candles,dict):
+                      continue
+                  ts=candles.get('t') or []
+                  vs=candles.get('v') or []
+                  cs=candles.get('c') or []
+                  diagnostics[pair]['candles']=len(ts)
+                  candidates=[]
+                  for t,v,c in zip(ts,vs,cs):
+                      try:
+                          if float(v)>0:
+                              candidates.append((int(t),float(v),float(c)))
+                      except Exception:
+                          pass
+                  for t,vv,close in candidates[-3:]:
+                      start_ms=t*1000
+                      end_ms=start_ms+60000
+                      try:
+                          base,quote=pair.split('/')
+                          trades=get(f'/v2/trade/history/{base}/{quote}', {'from':end_ms,'limit':1000})
+                          if isinstance(trades,dict):
+                              trades=[trades]
+                          minute=[x for x in (trades or []) if start_ms <= int(x.get('timestamp') or 0) < end_ms]
+                          qty=sum(float(x.get('quantity') or 0) for x in minute)
+                          cost=sum(float(x.get('cost') or 0) for x in minute)
+                          observations.append({
+                              'pair':pair,'timestamp_s':t,'candle_v':vv,'close':close,'trades':len(minute),
+                              'sum_quantity_base':qty,'sum_cost_quote':cost,
+                              'v_over_base': vv/qty if qty else None,
+                              'v_over_quote': vv/cost if cost else None,
+                              'v_times_close_over_quote': vv*close/cost if cost else None,
+                              'v_div_close_over_base': vv/close/qty if qty and close else None,
+                          })
+                      except Exception as e:
+                          observations.append({'pair':pair,'timestamp_s':t,'candle_v':vv,'close':close,'trade_error':repr(e)[:300]})
+              except Exception as e:
+                  diagnostics[pair]={'error':repr(e)[:300]}
+
+          covered=[r for r in observations if r.get('trades',0)>0]
           scores={'base':[],'quote':[]}
-          for r in rows:
-              if r['trades']:
-                  if r['v_over_base'] is not None: scores['base'].append(abs(r['v_over_base']-1))
-                  if r['v_over_quote'] is not None: scores['quote'].append(abs(r['v_over_quote']-1))
-          med={k:(sorted(v)[len(v)//2] if v else None) for k,v in scores.items()}
+          for r in covered:
+              if r.get('v_over_base') is not None: scores['base'].append(abs(r['v_over_base']-1))
+              if r.get('v_over_quote') is not None: scores['quote'].append(abs(r['v_over_quote']-1))
+          def median(v):
+              if not v: return None
+              s=sorted(v); return s[len(s)//2]
+          med={k:median(v) for k,v in scores.items()}
           interpretation='unresolved'
           if med['base'] is not None and med['quote'] is not None:
               if med['base'] < 0.15 and med['base'] < med['quote']/3: interpretation='base_volume'
               elif med['quote'] < 0.15 and med['quote'] < med['base']/3: interpretation='quote_volume'
-          out={'pair':'BTC/USDT','rows':rows,'median_abs_ratio_error':med,'interpretation':interpretation}
+
+          out={
+              'pairs_tested':CANDIDATES,
+              'diagnostics':diagnostics,
+              'observations':observations,
+              'covered_minutes':len(covered),
+              'median_abs_ratio_error':med,
+              'interpretation':interpretation,
+          }
           Path('latoken_volume_audit.json').write_text(json.dumps(out,indent=2),encoding='utf-8')
           print(json.dumps(out,indent=2))
           PY
