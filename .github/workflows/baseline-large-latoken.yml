@@ -1,0 +1,67 @@
+name: Baseline LARGE LATOKEN CatBoost OOS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/baseline-large-latoken.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SOURCE_RUN_ID: "34525317429"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install training stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install 'catboost>=1.2'
+      - name: Download immutable LATOKEN shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: latoken-large-*
+          path: downloaded/latoken
+          github-token: ${{ github.token }}
+          repository: Shtenco/crypto_pump
+          run-id: ${{ env.SOURCE_RUN_ID }}
+      - name: Merge, causal features and strict targets
+        run: |
+          python scripts/merge_real_shards.py downloaded/latoken \
+            --min-bars 600 \
+            --out data/baseline/panel.parquet \
+            --report artifacts/baseline/data_report.json
+          crypto-pump features-v2 data/baseline/panel.parquet data/baseline/features.parquet --benchmark-symbol LATOKEN:BTCUSDT
+          crypto-pump labels-v2 data/baseline/features.parquet data/baseline/labeled.parquet
+      - name: Full-dataset strict holdout CatBoost baseline
+        run: |
+          python scripts/train_large_baseline.py \
+            data/baseline/labeled.parquet \
+            artifacts/baseline/model \
+            --iterations 150 \
+            --depth 6 \
+            --learning-rate 0.06 \
+            --test-fraction 0.25 \
+            --embargo-bars 12 \
+            --top-k 10
+          cat artifacts/baseline/model/baseline_oos_metrics.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: latoken-large-baseline-${{ github.run_id }}
+          path: artifacts/baseline/
+          if-no-files-found: warn
+          retention-days: 30
