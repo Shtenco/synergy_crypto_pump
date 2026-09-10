@@ -1,0 +1,80 @@
+name: Smoke Uniswap RPC failover
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/smoke-uniswap-rpc.yml"
+      - "scripts/build_real_dataset_v2.py"
+      - "src/crypto_pump/data_sources/uniswap_cryo.py"
+      - "src/crypto_pump/data_sources/common.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  smoke-uniswap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ETH_RPC_URL: ${{ secrets.ETH_RPC_URL }}
+      ETH_RPC_FALLBACKS: ${{ secrets.ETH_RPC_FALLBACKS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install collector stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - name: Reuse verified Cryo 0.3.2 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: cryo-linux-x86_64
+          path: ${{ runner.temp }}/cryo-bin
+          github-token: ${{ github.token }}
+          repository: Shtenco/crypto_pump
+          run-id: 34525317429
+      - name: Enable Cryo
+        run: |
+          chmod +x "${{ runner.temp }}/cryo-bin/cryo"
+          echo "${{ runner.temp }}/cryo-bin" >> "$GITHUB_PATH"
+          "${{ runner.temp }}/cryo-bin/cryo" --version
+      - name: Collect real Uniswap smoke shard with RPC failover
+        run: |
+          python scripts/build_real_dataset_v2.py \
+            --skip-latoken \
+            --uniswap-blocks 12000 \
+            --uniswap-pool-lookback-blocks 100000 \
+            --uniswap-max-pools 80 \
+            --min-bars 1 \
+            --out data/uniswap_smoke/panel.parquet \
+            --report artifacts/uniswap_smoke/report.json
+      - name: Validate non-empty DEX panel
+        run: |
+          python - <<'PY'
+          import json
+          import pandas as pd
+          p = pd.read_parquet('data/uniswap_smoke/panel.parquet')
+          r = json.load(open('artifacts/uniswap_smoke/report.json'))
+          assert len(p) > 0, 'empty Uniswap panel'
+          assert p['symbol'].nunique() > 0, 'no Uniswap symbols'
+          print({'rows': len(p), 'symbols': int(p['symbol'].nunique()), 'min': str(p.timestamp.min()), 'max': str(p.timestamp.max())})
+          print(json.dumps(r, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uniswap-rpc-smoke-${{ github.run_id }}
+          path: |
+            data/uniswap_smoke/
+            artifacts/uniswap_smoke/
+          if-no-files-found: warn
+          retention-days: 7
