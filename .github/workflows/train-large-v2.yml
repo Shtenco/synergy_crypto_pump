@@ -113,15 +113,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: cryo-linux-x86_64
-          path: "$HOME/.local/bin"
+          path: ${{ runner.temp }}/cryo-bin
       - name: Enable Cryo and RPC
         run: |
-          chmod +x "$HOME/.local/bin/cryo"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          chmod +x "${{ runner.temp }}/cryo-bin/cryo"
+          echo "${{ runner.temp }}/cryo-bin" >> "$GITHUB_PATH"
           if [ -z "$ETH_RPC_URL" ]; then
             echo "ETH_RPC_URL=https://eth.llamarpc.com" >> "$GITHUB_ENV"
           fi
-          "$HOME/.local/bin/cryo" --version
+          "${{ runner.temp }}/cryo-bin/cryo" --version
       - name: Collect 250k-block Uniswap V3 shard
         id: collect
         continue-on-error: true
