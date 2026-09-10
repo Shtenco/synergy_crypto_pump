@@ -23,6 +23,37 @@ def _save_report(path: str, payload: dict) -> None:
     print(json.dumps(payload, indent=2, default=str), flush=True)
 
 
+def _rpc_candidates() -> list[tuple[str, str]]:
+    """Return ordered Ethereum RPC candidates without leaking secret URLs to reports."""
+    candidates: list[tuple[str, str]] = []
+    primary = (os.getenv("ETH_RPC_URL") or "").strip()
+    if primary:
+        candidates.append(("env_primary", primary))
+
+    custom = (os.getenv("ETH_RPC_FALLBACKS") or "").strip()
+    if custom:
+        for i, url in enumerate(custom.split(",")):
+            url = url.strip()
+            if url:
+                candidates.append((f"env_fallback_{i + 1}", url))
+
+    # Keyless public fallbacks. They are deliberately after a user-supplied RPC.
+    candidates.extend([
+        ("publicnode", "https://ethereum-rpc.publicnode.com"),
+        ("1rpc", "https://public.1rpc.io/eth"),
+        ("llamarpc", "https://eth.llamarpc.com"),
+    ])
+
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for label, url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append((label, url))
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Collect real LATOKEN + Uniswap data and build a point-in-time 5m panel")
     ap.add_argument("--out", default="data/real_v2/panel.parquet")
@@ -66,21 +97,47 @@ def main() -> None:
             reports.append({"source": "latoken", "error": repr(exc)})
 
     if not args.skip_uniswap:
-        rpc = os.getenv("ETH_RPC_URL") or "https://eth.llamarpc.com"
-        try:
-            uni, rep = collect_uniswap_v3_panel(
-                rpc_url=rpc,
-                lookback_blocks=args.uniswap_blocks,
-                end_block_offset=args.uniswap_end_block_offset,
-                pool_lookback_blocks=(args.uniswap_pool_lookback_blocks or None),
-                max_pools=args.uniswap_max_pools,
-                workdir="data/real_v2/cryo",
-            )
-            reports.append(rep)
-            if len(uni):
-                panels.append(uni)
-        except Exception as exc:
-            reports.append({"source": "uniswap_cryo", "error": repr(exc)})
+        attempts: list[dict[str, str]] = []
+        success_rep: dict | None = None
+        success_panel: pd.DataFrame | None = None
+        for idx, (rpc_label, rpc) in enumerate(_rpc_candidates()):
+            try:
+                uni, rep = collect_uniswap_v3_panel(
+                    rpc_url=rpc,
+                    lookback_blocks=args.uniswap_blocks,
+                    end_block_offset=args.uniswap_end_block_offset,
+                    pool_lookback_blocks=(args.uniswap_pool_lookback_blocks or None),
+                    max_pools=args.uniswap_max_pools,
+                    workdir=f"data/real_v2/cryo_rpc_{idx}",
+                )
+                if len(uni) and not rep.get("error"):
+                    success_rep = dict(rep)
+                    success_rep["rpc_label"] = rpc_label
+                    success_panel = uni
+                    attempts.append({"rpc_label": rpc_label, "status": "success"})
+                    break
+                attempts.append({
+                    "rpc_label": rpc_label,
+                    "status": "empty",
+                    "error": str(rep.get("error") or "no market bars")[:800],
+                })
+            except Exception as exc:
+                attempts.append({
+                    "rpc_label": rpc_label,
+                    "status": "error",
+                    "error": repr(exc)[:800],
+                })
+
+        if success_rep is not None and success_panel is not None:
+            success_rep["rpc_attempts"] = attempts
+            reports.append(success_rep)
+            panels.append(success_panel)
+        else:
+            reports.append({
+                "source": "uniswap_cryo",
+                "error": "all Ethereum RPC candidates failed or returned no bars",
+                "rpc_attempts": attempts,
+            })
 
     pre_report = {
         "sources": reports,
