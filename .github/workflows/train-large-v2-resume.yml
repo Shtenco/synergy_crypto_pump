@@ -6,10 +6,11 @@ on:
     paths:
       - ".github/workflows/train-large-v2-resume.yml"
       - "scripts/train_v2_staged.py"
+      - "scripts/walk_forward_v2_staged.py"
   workflow_dispatch:
     inputs:
       resume_run_id:
-        description: "Optional prior staged run ID to restore checkpoints from"
+        description: "Optional prior staged run ID to restore OOS/final checkpoints from"
         required: false
         type: string
 
@@ -67,26 +68,50 @@ jobs:
               print(c, 'n=', len(x), 'positives=', int(x.sum()), 'rate=', float(x.mean()) if len(x) else None)
           print(json.dumps(json.load(open('artifacts/real_v2/data_report.json')), indent=2))
           PY
-      - name: Strict 2-fold purged OOS CatBoost + YetiRank
+      - name: Restore prior staged OOS checkpoints
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.resume_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: crypto-pump-v2-oos-staged-*
+          path: artifacts/real_v2/oos
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: Shtenco/crypto_pump
+          run-id: ${{ inputs.resume_run_id }}
+      - name: Checkpointable 2-fold purged OOS CatBoost + YetiRank
         run: |
-          crypto-pump walk-forward-v2 \
+          mkdir -p artifacts/real_v2/oos
+          python scripts/walk_forward_v2_staged.py \
             data/real_v2/labeled.parquet \
             artifacts/real_v2/oos \
             --n-splits 2 \
+            --purge-bars 288 \
+            --embargo-bars 12 \
             --top-k 10 \
-            --model-kind catboost
-      - name: Summarize OOS
+            --classifier-iterations 160 \
+            --classifier-depth 6 \
+            --ranker-iterations 100 \
+            --ranker-depth 5 \
+            --learning-rate 0.06 \
+            --threads 2
+      - name: Summarize staged OOS
         if: always()
         run: |
-          python scripts/summarize_real_v2.py || true
-          test ! -f artifacts/real_v2/SUMMARY.md || cat artifacts/real_v2/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload OOS continuation
+          if [ -f artifacts/real_v2/oos/stage_report.json ]; then
+            cat artifacts/real_v2/oos/stage_report.json
+            cat artifacts/real_v2/oos/stage_report.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f artifacts/real_v2/oos/oos_metrics.json ]; then
+            printf '\n\n## Aggregate OOS\n\n' >> "$GITHUB_STEP_SUMMARY"
+            cat artifacts/real_v2/oos/oos_metrics.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload OOS models, predictions and partial checkpoints
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crypto-pump-v2-large-oos-resume-${{ github.run_id }}
+          name: crypto-pump-v2-oos-staged-${{ github.run_id }}
           path: |
-            artifacts/real_v2/
+            artifacts/real_v2/oos/
           if-no-files-found: warn
           retention-days: 30
 
@@ -122,7 +147,7 @@ jobs:
         run: |
           crypto-pump features-v2 data/real_v2/panel.parquet data/real_v2/features.parquet --benchmark-symbol LATOKEN:BTCUSDT
           crypto-pump labels-v2 data/real_v2/features.parquet data/real_v2/labeled.parquet
-      - name: Restore prior staged checkpoints
+      - name: Restore prior staged final-model checkpoints
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.resume_run_id != '' }}
         uses: actions/download-artifact@v4
         with:
