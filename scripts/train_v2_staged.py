@@ -93,13 +93,17 @@ def _save_or_load_ranker(
         model.load_model(path)
         print(f"RESUME ranker {spec.name} <- {path}", flush=True)
         return model
+    # `train` is already globally sorted by timestamp,symbol. Keep only a tiny
+    # timestamp/MFE frame for relevance and materialize the feature matrix once
+    # in float32. This avoids the old full float64 dataframe copy + float32 copy.
     use = train[spec.mfe_col].notna().to_numpy()
-    cols = ["timestamp", "symbol", spec.mfe_col, *features]
-    df = train.loc[use, cols].sort_values(["timestamp", "symbol"], kind="mergesort")
-    _diag("ranker", spec.name, len(df), len(features))
-    relevance = df.groupby("timestamp", sort=False)[spec.mfe_col].rank(pct=True, ascending=True).to_numpy(np.float32)
-    group_id = pd.factorize(df["timestamp"], sort=False)[0].astype(np.int32, copy=False)
-    x = df[features].astype(np.float32)
+    meta = train.loc[use, ["timestamp", spec.mfe_col]]
+    _diag("ranker", spec.name, int(use.sum()), len(features))
+    relevance = meta.groupby("timestamp", sort=False)[spec.mfe_col].rank(
+        pct=True, ascending=True
+    ).to_numpy(np.float32)
+    group_id = pd.factorize(meta["timestamp"], sort=False)[0].astype(np.int32, copy=False)
+    x = train.loc[use, features].astype(np.float32)
     pool = Pool(x, label=relevance, group_id=group_id)
     model = CatBoostRanker(
         loss_function="YetiRank:mode=NDCG",
@@ -117,7 +121,7 @@ def _save_or_load_ranker(
     model.fit(pool)
     path.parent.mkdir(parents=True, exist_ok=True)
     model.save_model(path)
-    del df, x, pool, relevance, group_id
+    del meta, x, pool, relevance, group_id
     gc.collect()
     return model
 
