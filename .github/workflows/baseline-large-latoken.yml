@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/baseline-large-latoken.yml"
+      - "scripts/train_large_baseline.py"
+      - "scripts/run_falsification.py"
+      - "src/crypto_pump/v2/falsification.py"
   workflow_dispatch:
 
 permissions:
@@ -18,7 +21,7 @@ env:
 jobs:
   baseline:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -57,7 +60,17 @@ jobs:
             --test-fraction 0.25 \
             --embargo-bars 12 \
             --top-k 10
+      - name: Falsify baseline lift
+        run: |
+          python scripts/run_falsification.py \
+            artifacts/baseline/model/holdout_predictions.parquet \
+            artifacts/baseline/falsification.json \
+            --top-k 10 \
+            --pre-pump-threshold 0.05 \
+            --placebo-shift-bars 2016
           cat artifacts/baseline/model/baseline_oos_metrics.json >> "$GITHUB_STEP_SUMMARY"
+          printf '\n\n## Falsification\n\n' >> "$GITHUB_STEP_SUMMARY"
+          cat artifacts/baseline/falsification.json >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
