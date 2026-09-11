@@ -11,6 +11,27 @@ from .config import DEFAULT_HORIZONS
 from .labels import v2_label_columns
 
 
+MODEL_METADATA_COLUMNS = {
+    # Pipeline bookkeeping. These can proxy listing time, gaps, source layout or
+    # row order and therefore must never silently become predictive features.
+    "series_segment",
+    "row_id",
+    "pair_id",
+    "pool_id",
+    "token_id",
+    "currency_id",
+    "quote_id",
+    "chain_id",
+    "block_number",
+    "log_index",
+    "transaction_index",
+    "base_decimals",
+    "quote_decimals",
+    "token0_decimals",
+    "token1_decimals",
+}
+
+
 def _safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
     return a.astype(float) / b.astype(float).replace(0.0, np.nan)
 
@@ -192,13 +213,14 @@ class V2FeatureBuilder:
 
 
 def v2_numeric_feature_columns(frame: pd.DataFrame, exclude: Iterable[str] = ()) -> list[str]:
-    blocked = v2_label_columns(DEFAULT_HORIZONS) | {
+    blocked = v2_label_columns(DEFAULT_HORIZONS) | MODEL_METADATA_COLUMNS | {
         "target", "future_max_return", "future_min_return", "future_end_return",
         "open", "high", "low", "close", "volume", *exclude
     }
     return [
         c for c in frame.select_dtypes(include=[np.number]).columns
         if c not in blocked
+        and not c.lower().endswith(("_id", "_index"))
         and not c.startswith(("target__", "mfe__", "mae__", "end_return__", "hit_bar__"))
         and frame[c].notna().any()
     ]
