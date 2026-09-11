@@ -123,25 +123,57 @@ def _decluster(df: pd.DataFrame, target_col: str, score_col: str, top_k: int) ->
     }
 
 
+def _shuffle_by_groups(x: pd.DataFrame, target_col: str, group_col: str, rng: np.random.Generator) -> pd.Series:
+    shuffled = x[target_col].copy()
+    for _, idx in x.groupby(group_col, sort=False).groups.items():
+        vals = shuffled.loc[idx].to_numpy(copy=True)
+        rng.shuffle(vals)
+        shuffled.loc[idx] = vals
+    return shuffled
+
+
 def _placebos(df: pd.DataFrame, target_col: str, score_col: str, top_k: int, shift_bars: int, seed: int = 42) -> dict:
     use = df[target_col].notna() & df[score_col].notna()
     x = df.loc[use, ["timestamp", "symbol", target_col, score_col]].copy()
     x = x.sort_values(["symbol", "timestamp"], kind="mergesort").reset_index(drop=True)
     if x.empty:
         return {}
+
+    # 1) Global permutation: destroys symbol, time and cross-sectional structure.
     rng = np.random.default_rng(seed)
-    shuffled = x[target_col].copy()
-    for _, idx in x.groupby("symbol", sort=False).groups.items():
-        vals = shuffled.loc[idx].to_numpy(copy=True)
-        rng.shuffle(vals)
-        shuffled.loc[idx] = vals
-    sx = x.copy()
-    sx["_placebo"] = shuffled.astype(float)
-    tx = x.copy()
-    tx["_placebo"] = x.groupby("symbol", sort=False)[target_col].shift(shift_bars)
+    global_x = x.copy()
+    global_values = global_x[target_col].to_numpy(copy=True)
+    rng.shuffle(global_values)
+    global_x["_placebo"] = global_values
+
+    # 2) Within-symbol permutation: preserves each symbol's unconditional pump
+    # rate but destroys timing. If this remains strong, symbol memorization or
+    # symbol-specific feature distributions are likely carrying the score.
+    symbol_x = x.copy()
+    symbol_x["_placebo"] = _shuffle_by_groups(x, target_col, "symbol", np.random.default_rng(seed + 1)).astype(float)
+
+    # 3) Within-timestamp permutation: preserves exactly how many positives
+    # occur at each timestamp but destroys which symbol pumps. This is a direct
+    # null for cross-sectional ranking skill.
+    time_x = x.copy()
+    time_x["_placebo"] = _shuffle_by_groups(x, target_col, "timestamp", np.random.default_rng(seed + 2)).astype(float)
+
+    # 4) Large temporal shift inside symbol: preserves target autocorrelation
+    # shape/base rate while breaking alignment with the contemporaneous score.
+    shift_x = x.copy()
+    shift_x["_placebo"] = x.groupby("symbol", sort=False)[target_col].shift(shift_bars)
+
     return {
-        "within_symbol_random_permutation": _basic_metrics(sx, "_placebo", score_col, top_k),
-        f"within_symbol_shift_{shift_bars}_bars": _basic_metrics(tx, "_placebo", score_col, top_k),
+        "global_random_permutation": _basic_metrics(global_x, "_placebo", score_col, top_k),
+        "within_symbol_random_permutation": _basic_metrics(symbol_x, "_placebo", score_col, top_k),
+        "within_timestamp_random_permutation": _basic_metrics(time_x, "_placebo", score_col, top_k),
+        f"within_symbol_shift_{shift_bars}_bars": _basic_metrics(shift_x, "_placebo", score_col, top_k),
+        "interpretation": {
+            "global": "should collapse to base rate if the metric implementation is sane",
+            "within_symbol": "tests timing skill beyond persistent symbol identity/base-rate differences",
+            "within_timestamp": "tests which-symbol ranking skill while preserving market-wide event intensity",
+            "shift": "tests long-lag alignment inside each symbol",
+        },
     }
 
 
