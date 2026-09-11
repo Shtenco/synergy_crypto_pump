@@ -46,11 +46,20 @@ def main() -> None:
     train_mask_time = d["timestamp"].isin(train_times).to_numpy()
     test_mask_time = d["timestamp"].isin(test_times).to_numpy()
 
+    audit_cols = [
+        c for c in ("current_candle_return", "ret_1", "ret_3", "ret_6", "ret_12")
+        if c in d.columns
+    ]
+    label_cols = [s.target_col for s in DEFAULT_HORIZONS]
+    holdout = d.loc[test_mask_time, ["timestamp", "symbol", *audit_cols, *label_cols]].copy()
+    holdout["row_id"] = holdout.index.astype(np.int64)
+
     report: dict[str, object] = {
         "rows": int(len(d)),
         "segmented_symbols": int(d["symbol"].nunique()),
         "unique_timestamps": int(len(times)),
         "feature_count": int(len(features)),
+        "features": features,
         "iterations": args.iterations,
         "depth": args.depth,
         "learning_rate": args.learning_rate,
@@ -61,8 +70,6 @@ def main() -> None:
         "targets": {},
     }
 
-    # Materialize one float32 matrix at a time to keep peak RAM bounded on
-    # GitHub-hosted runners. Feature names remain stable for saved CatBoost models.
     for spec in DEFAULT_HORIZONS:
         valid = d[spec.target_col].notna().to_numpy()
         tr = train_mask_time & valid
@@ -132,12 +139,27 @@ def main() -> None:
 
         model_path = outdir / f"catboost_baseline_{spec.name}.cbm"
         model.save_model(model_path)
+        fi = model.get_feature_importance()
+        importance = sorted(
+            ({"feature": name, "importance": float(value)} for name, value in zip(features, fi)),
+            key=lambda x: x["importance"],
+            reverse=True,
+        )
+        (outdir / f"feature_importance_{spec.name}.json").write_text(
+            json.dumps(importance, indent=2), encoding="utf-8"
+        )
+        metrics["top_features"] = importance[:20]
+
+        row_ids = np.flatnonzero(te)
+        holdout.loc[row_ids, f"p__{spec.name}"] = np.asarray(p, dtype=np.float32)
         report["targets"][spec.name] = metrics
         print(json.dumps({spec.name: metrics}, indent=2), flush=True)
 
-        del x_train, x_test, model, p, eval_df, top, y_train, y_test
+        del x_train, x_test, model, p, eval_df, top, y_train, y_test, fi, importance
         gc.collect()
 
+    holdout.reset_index(drop=True).to_parquet(outdir / "holdout_predictions.parquet", index=False)
+    report["holdout_predictions"] = str(outdir / "holdout_predictions.parquet")
     (outdir / "baseline_oos_metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2), flush=True)
 
