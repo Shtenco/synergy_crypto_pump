@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/train-large-v2-resume.yml"
+      - "scripts/train_v2_staged.py"
   workflow_dispatch:
 
 permissions:
@@ -116,19 +117,32 @@ jobs:
         run: |
           crypto-pump features-v2 data/real_v2/panel.parquet data/real_v2/features.parquet --benchmark-symbol LATOKEN:BTCUSDT
           crypto-pump labels-v2 data/real_v2/features.parquet data/real_v2/labeled.parquet
-      - name: Fit final full-history CatBoost + YetiRank V2 model
+      - name: Fit staged final CatBoost + YetiRank V2 model
         run: |
           mkdir -p artifacts/real_v2/model
-          crypto-pump train-v2 \
+          python scripts/train_v2_staged.py \
             data/real_v2/labeled.parquet \
-            artifacts/real_v2/model/crypto_pump_v2_large.joblib \
-            --model-kind catboost
-      - name: Upload final model continuation
+            artifacts/real_v2/model \
+            --model-path crypto_pump_v2_large.joblib \
+            --classifier-iterations 220 \
+            --classifier-depth 6 \
+            --ranker-iterations 180 \
+            --ranker-depth 5 \
+            --learning-rate 0.05 \
+            --threads 2
+      - name: Publish staged diagnostics
+        if: always()
+        run: |
+          if [ -f artifacts/real_v2/model/stage_report.json ]; then
+            cat artifacts/real_v2/model/stage_report.json
+            cat artifacts/real_v2/model/stage_report.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload final model and partial checkpoints
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crypto-pump-v2-large-model-resume-${{ github.run_id }}
+          name: crypto-pump-v2-staged-checkpoints-${{ github.run_id }}
           path: |
-            artifacts/real_v2/
+            artifacts/real_v2/model/
           if-no-files-found: warn
           retention-days: 30
