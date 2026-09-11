@@ -7,6 +7,11 @@ on:
       - ".github/workflows/train-large-v2-resume.yml"
       - "scripts/train_v2_staged.py"
   workflow_dispatch:
+    inputs:
+      resume_run_id:
+        description: "Optional prior staged run ID to restore checkpoints from"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -117,6 +122,16 @@ jobs:
         run: |
           crypto-pump features-v2 data/real_v2/panel.parquet data/real_v2/features.parquet --benchmark-symbol LATOKEN:BTCUSDT
           crypto-pump labels-v2 data/real_v2/features.parquet data/real_v2/labeled.parquet
+      - name: Restore prior staged checkpoints
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.resume_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: crypto-pump-v2-staged-checkpoints-*
+          path: artifacts/real_v2/model
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: Shtenco/crypto_pump
+          run-id: ${{ inputs.resume_run_id }}
       - name: Fit staged final CatBoost + YetiRank V2 model
         run: |
           mkdir -p artifacts/real_v2/model
