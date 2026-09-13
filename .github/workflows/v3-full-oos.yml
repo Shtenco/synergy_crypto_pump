@@ -1,0 +1,178 @@
+name: V3 Pump.fun 33.58M OOS + COMBINED preflight
+
+on:
+  push:
+    branches: [v3-execution-risk-shadow]
+    paths:
+      - ".github/workflows/v3-full-oos.yml"
+      - "scripts/v3_*.py"
+      - "src/crypto_pump/v3/**"
+      - "tests/test_v3_*.py"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/v3-full-oos.yml"
+      - "scripts/v3_*.py"
+      - "src/crypto_pump/v3/**"
+      - "tests/test_v3_*.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  HF_HUB_ENABLE_HF_TRANSFER: "0"
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      legacy_artifact_name: ${{ steps.legacy.outputs.artifact_name }}
+      legacy_run_id: ${{ steps.legacy.outputs.run_id }}
+      legacy_found: ${{ steps.legacy.outputs.found }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install V3 + tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[v3,dev]'
+      - name: Run V3 fail-closed tests
+        run: |
+          pytest -q tests/test_v3_combined_oos.py tests/test_v3_execution.py tests/test_v3_metrics.py tests/test_v3_promotion.py
+      - name: Discover newest non-expired legacy OOS artifact
+        id: legacy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' > /tmp/legacy.env
+          import json, os, urllib.request
+          repo = os.environ['GITHUB_REPOSITORY']
+          token = os.environ['GH_TOKEN']
+          req = urllib.request.Request(
+              f'https://api.github.com/repos/{repo}/actions/artifacts?per_page=100',
+              headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'},
+          )
+          with urllib.request.urlopen(req, timeout=60) as r:
+              payload = json.load(r)
+          prefixes = ('crypto-pump-v2-oos-staged-', 'crypto-pump-real-v2-', 'latoken-large-baseline-')
+          candidates = [a for a in payload.get('artifacts', []) if not a.get('expired') and str(a.get('name','')).startswith(prefixes)]
+          candidates.sort(key=lambda a: a.get('created_at',''), reverse=True)
+          if not candidates:
+              print('found=false')
+              print('artifact_name=')
+              print('run_id=')
+          else:
+              a = candidates[0]
+              print('found=true')
+              print('artifact_name=' + str(a['name']))
+              print('run_id=' + str((a.get('workflow_run') or {}).get('id') or ''))
+          PY
+          cat /tmp/legacy.env
+          cat /tmp/legacy.env >> "$GITHUB_OUTPUT"
+          {
+            echo '## Legacy OOS artifact discovery'
+            sed 's/^/- /' /tmp/legacy.env
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  pumpfun-oos:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install V3 stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[v3]'
+      - name: Download and build clean 33.58M Pump.fun 5m panel
+        run: |
+          python scripts/v3_build_historical_corpus.py \
+            --data-dir data/v3/hf_pumpfun_corpus \
+            --output data/v3/pumpfun_historical_5m.parquet \
+            --threads 4 \
+            --memory-limit 7GB \
+            | tee artifacts_pumpfun_build.log
+          df -h
+      - name: Download point-in-time SOL/USD 5m history
+        run: |
+          python scripts/v3_download_sol_usd.py \
+            --panel data/v3/pumpfun_historical_5m.parquet \
+            --output data/v3/sol_usd_5m.parquet
+      - name: Enrich panel with point-in-time bonding-curve USD liquidity
+        run: |
+          python scripts/v3_enrich_pumpfun_liquidity.py \
+            --panel data/v3/pumpfun_historical_5m.parquet \
+            --corpus-dir data/v3/hf_pumpfun_corpus \
+            --sol-usd data/v3/sol_usd_5m.parquet \
+            --output data/v3/pumpfun_historical_5m_liquidity.parquet \
+            --report artifacts/v3/pumpfun_liquidity_report.json
+      - name: Purged V3 TP-before-SL OOS with real execution simulation
+        run: |
+          python scripts/v3_train_trading.py \
+            data/v3/pumpfun_historical_5m_liquidity.parquet \
+            artifacts/v3/pumpfun_33m \
+            --n-splits 3 \
+            --model-kind catboost \
+            --probability-threshold 0.70 \
+            --top-k 10 \
+            --notional-usd 50
+      - name: Publish Pump.fun OOS metrics
+        if: always()
+        run: |
+          if [ -f artifacts/v3/pumpfun_33m/oos/v3_oos_report.json ]; then
+            echo '## Pump.fun 33.58M V3 OOS' >> "$GITHUB_STEP_SUMMARY"
+            cat artifacts/v3/pumpfun_33m/oos/v3_oos_report.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f artifacts/v3/pumpfun_liquidity_report.json ]; then
+            echo '## Liquidity evidence' >> "$GITHUB_STEP_SUMMARY"
+            cat artifacts/v3/pumpfun_liquidity_report.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload Pump.fun V3 OOS ledger and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pumpfun-v3-33m-oos-${{ github.run_id }}
+          path: |
+            artifacts/v3/pumpfun_33m/oos/v3_oos_predictions.parquet
+            artifacts/v3/pumpfun_33m/oos/v3_oos_trades.parquet
+            artifacts/v3/pumpfun_33m/oos/v3_oos_report.json
+            artifacts/v3/pumpfun_33m/v3_train_summary.json
+            artifacts/v3/pumpfun_liquidity_report.json
+            artifacts_pumpfun_build.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  evidence-status:
+    if: always()
+    needs: [preflight, pumpfun-oos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Emit fail-closed evidence verdict
+        run: |
+          echo '## COMBINED_OOS evidence status' >> "$GITHUB_STEP_SUMMARY"
+          echo "legacy_found=${{ needs.preflight.outputs.legacy_found }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "legacy_artifact=${{ needs.preflight.outputs.legacy_artifact_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "legacy_run_id=${{ needs.preflight.outputs.legacy_run_id }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "pumpfun_job=${{ needs.pumpfun-oos.result }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.preflight.outputs.legacy_found }}" != "true" ] || [ "${{ needs.pumpfun-oos.result }}" != "success" ]; then
+            echo 'VERDICT=BLOCKED (insufficient executable OOS evidence; never promote)' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'VERDICT=READY_FOR_COMBINED_REPLAY (historical evidence exists; canary still requires live shadow gate)' >> "$GITHUB_STEP_SUMMARY"
+          fi
