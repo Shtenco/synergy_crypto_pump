@@ -5,10 +5,10 @@ import json
 import time
 from pathlib import Path
 
+import joblib
 import pandas as pd
 
 from crypto_pump.v2.features import V2FeatureBuilder
-from crypto_pump.v2.pipeline import V2Ensemble
 from crypto_pump.v3.live import ShadowSignalEngine, ShadowStrategyConfig
 from crypto_pump.v3.monitor import health_report
 from crypto_pump.v3.panel import normalize_pumpportal_trades, trades_to_panel
@@ -22,8 +22,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--store", default="data/v3/live.sqlite")
     p.add_argument("--model", required=True)
     p.add_argument("--equity-usd", type=float, default=10_000.0)
-    p.add_argument("--probability-column", default="pump_probability__20pct_1h")
-    p.add_argument("--horizon", default="20pct_1h")
+    p.add_argument("--probability-column", default="pump_probability__tp20_sl08_1h")
+    p.add_argument("--horizon", default="tp20_sl08_1h")
     p.add_argument("--min-probability", type=float, default=0.70)
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument("--notional-usd", type=float, default=50.0)
@@ -34,20 +34,22 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def expected_model_features(model: V2Ensemble) -> list[str]:
+def expected_model_features(model) -> list[str]:
+    direct = getattr(model, "features", None)
+    if direct:
+        return sorted(map(str, direct))
     names: set[str] = set()
     for branch_name in ("tabular", "ranker", "social"):
         branch = getattr(model, branch_name, None)
         if branch is None:
             continue
-        for attr in ("features", "feature_columns"):
-            value = getattr(branch, attr, None)
-            if value:
-                names.update(map(str, value))
+        value = getattr(branch, "features", None)
+        if value:
+            names.update(map(str, value))
     return sorted(names)
 
 
-def cycle(args: argparse.Namespace, model: V2Ensemble, store: V3Store, quote: JupiterQuoteClient) -> dict:
+def cycle(args: argparse.Namespace, model, store: V3Store, quote: JupiterQuoteClient) -> dict:
     since = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=args.lookback_hours)
     events = store.events(since=since)
     trades = normalize_pumpportal_trades(events)
@@ -98,6 +100,9 @@ def cycle(args: argparse.Namespace, model: V2Ensemble, store: V3Store, quote: Ju
             min_probability=args.min_probability,
             top_k=args.top_k,
             requested_notional_usd=args.notional_usd,
+            tp_return=0.20,
+            sl_return=-0.08,
+            max_hold_minutes=60,
             model_version=Path(args.model).name,
         ),
     )
@@ -116,7 +121,7 @@ def main() -> None:
     args = parse_args()
     store = V3Store(args.store)
     quote = JupiterQuoteClient()
-    model = V2Ensemble.load(args.model)
+    model = joblib.load(args.model)
     while True:
         try:
             print(json.dumps(cycle(args, model, store, quote), indent=2, default=str))
