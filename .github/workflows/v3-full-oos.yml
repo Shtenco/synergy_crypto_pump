@@ -1,4 +1,4 @@
-name: V3 Pump.fun 33.58M OOS + COMBINED preflight
+name: V3 COMBINED OOS — LATOKEN + Pump.fun 33.58M
 
 on:
   push:
@@ -24,6 +24,8 @@ permissions:
 env:
   PYTHONUNBUFFERED: "1"
   HF_HUB_ENABLE_HF_TRANSFER: "0"
+  LATOKEN_SOURCE_RUN_ID: "34525317429"
+  EVALUATION_EQUITY_USD: "5000"
 
 jobs:
   preflight:
@@ -43,10 +45,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e '.[v3,dev]'
-      - name: Run V3 fail-closed tests
+      - name: Compile and run fail-closed V3 tests
         run: |
+          python -m compileall -q src scripts
           pytest -q tests/test_v3_combined_oos.py tests/test_v3_execution.py tests/test_v3_metrics.py tests/test_v3_promotion.py
-      - name: Discover newest non-expired legacy OOS artifact
+      - name: Discover newest successful non-expired legacy OOS artifact
         id: legacy
         env:
           GH_TOKEN: ${{ github.token }}
@@ -57,24 +60,36 @@ jobs:
           import json, os, urllib.request
           repo = os.environ['GITHUB_REPOSITORY']
           token = os.environ['GH_TOKEN']
-          req = urllib.request.Request(
-              f'https://api.github.com/repos/{repo}/actions/artifacts?per_page=100',
-              headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'},
-          )
+          headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'}
+          req = urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/artifacts?per_page=100', headers=headers)
           with urllib.request.urlopen(req, timeout=60) as r:
-              payload = json.load(r)
+              artifacts = json.load(r).get('artifacts', [])
           prefixes = ('crypto-pump-v2-oos-staged-', 'crypto-pump-real-v2-', 'latoken-large-baseline-')
-          candidates = [a for a in payload.get('artifacts', []) if not a.get('expired') and str(a.get('name','')).startswith(prefixes)]
+          candidates = [a for a in artifacts if not a.get('expired') and str(a.get('name','')).startswith(prefixes)]
           candidates.sort(key=lambda a: a.get('created_at',''), reverse=True)
-          if not candidates:
+          chosen = None
+          for a in candidates:
+              run_id = str((a.get('workflow_run') or {}).get('id') or '')
+              if not run_id:
+                  continue
+              try:
+                  rr = urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/runs/{run_id}', headers=headers)
+                  with urllib.request.urlopen(rr, timeout=30) as r:
+                      run = json.load(r)
+                  if run.get('conclusion') == 'success':
+                      chosen = (a, run_id)
+                      break
+              except Exception:
+                  continue
+          if chosen is None:
               print('found=false')
               print('artifact_name=')
               print('run_id=')
           else:
-              a = candidates[0]
+              a, run_id = chosen
               print('found=true')
               print('artifact_name=' + str(a['name']))
-              print('run_id=' + str((a.get('workflow_run') or {}).get('id') or ''))
+              print('run_id=' + run_id)
           PY
           cat /tmp/legacy.env
           cat /tmp/legacy.env >> "$GITHUB_OUTPUT"
@@ -82,6 +97,89 @@ jobs:
             echo '## Legacy OOS artifact discovery'
             sed 's/^/- /' /tmp/legacy.env
           } >> "$GITHUB_STEP_SUMMARY"
+
+  legacy-replay:
+    needs: preflight
+    if: needs.preflight.outputs.legacy_found == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[v3]'
+      - name: Download successful frozen legacy OOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.preflight.outputs.legacy_artifact_name }}
+          path: downloaded/legacy
+          github-token: ${{ github.token }}
+          repository: Shtenco/crypto_pump
+          run-id: ${{ needs.preflight.outputs.legacy_run_id }}
+      - name: Locate frozen predictions and determine whether source panel is present
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          PRED="$(find downloaded/legacy -type f -name 'oos_predictions.parquet' | head -1 || true)"
+          if [ -z "$PRED" ]; then
+            PRED="$(find downloaded/legacy -type f -name 'holdout_predictions.parquet' | head -1 || true)"
+          fi
+          test -n "$PRED" || { echo 'No frozen OOS predictions in selected successful artifact'; find downloaded/legacy -maxdepth 6 -type f | sort; exit 2; }
+          PANEL="$(find downloaded/legacy -type f -name 'panel.parquet' | head -1 || true)"
+          echo "predictions=$PRED" >> "$GITHUB_OUTPUT"
+          if [ -n "$PANEL" ]; then
+            echo "panel=$PANEL" >> "$GITHUB_OUTPUT"
+            echo "need_source=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "panel=data/legacy/panel.parquet" >> "$GITHUB_OUTPUT"
+            echo "need_source=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download immutable LATOKEN source shards when legacy artifact has no panel
+        if: steps.locate.outputs.need_source == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: latoken-large-*
+          path: downloaded/latoken-source
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: Shtenco/crypto_pump
+          run-id: ${{ env.LATOKEN_SOURCE_RUN_ID }}
+      - name: Rebuild immutable LATOKEN panel when required
+        if: steps.locate.outputs.need_source == 'true'
+        run: |
+          python scripts/merge_real_shards.py downloaded/latoken-source \
+            --min-bars 600 \
+            --out data/legacy/panel.parquet \
+            --report artifacts/v3/latoken_legacy/source_panel_report.json
+      - name: Replay frozen LATOKEN OOS probabilities through conservative execution
+        shell: bash
+        run: |
+          mkdir -p artifacts/v3/latoken_legacy
+          cp "${{ steps.locate.outputs.predictions }}" artifacts/v3/latoken_legacy/legacy_oos_predictions.parquet
+          METRICS="$(find downloaded/legacy -type f \( -name 'oos_metrics.json' -o -name 'baseline_oos_metrics.json' \) | head -1 || true)"
+          if [ -n "$METRICS" ]; then cp "$METRICS" artifacts/v3/latoken_legacy/legacy_oos_metrics.json; fi
+          python scripts/v3_replay_latoken_oos.py \
+            --panel "${{ steps.locate.outputs.panel }}" \
+            --predictions artifacts/v3/latoken_legacy/legacy_oos_predictions.parquet \
+            --output-dir artifacts/v3/latoken_legacy \
+            --threshold 0.70 \
+            --top-k 10 \
+            --notional-usd 50 \
+            --liquidity-fraction 0.05
+          cat artifacts/v3/latoken_legacy/latoken_legacy_execution_report.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload executable legacy OOS replay
+        uses: actions/upload-artifact@v4
+        with:
+          name: latoken-legacy-replay-${{ github.run_id }}
+          path: artifacts/v3/latoken_legacy/
+          if-no-files-found: error
+          retention-days: 30
 
   pumpfun-oos:
     needs: preflight
@@ -133,6 +231,31 @@ jobs:
             --probability-threshold 0.70 \
             --top-k 10 \
             --notional-usd 50
+      - name: Extract whole-source execution stress for COMBINED gate
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('artifacts/v3/pumpfun_33m/oos/v3_oos_report.json')
+          r=json.loads(p.read_text())
+          sums={k:0.0 for k in ('costs_x2','latency_x2','costs_x2_latency_x2')}
+          counts={k:0 for k in sums}
+          for fold in r.get('folds',[]):
+              for spec in fold.get('specs',{}).values():
+                  stress=spec.get('execution_stress',{})
+                  for key in sums:
+                      value=((stress.get(key) or {}).get('metrics') or {}).get('net_pnl_usd')
+                      if value is not None:
+                          sums[key]+=float(value); counts[key]+=1
+          out={
+              'costs_x2_net_pnl_usd': sums['costs_x2'] if counts['costs_x2'] else None,
+              'latency_x2_net_pnl_usd': sums['latency_x2'] if counts['latency_x2'] else None,
+              'costs_x2_latency_x2_net_pnl_usd': sums['costs_x2_latency_x2'] if counts['costs_x2_latency_x2'] else None,
+              'components': counts,
+          }
+          Path('artifacts/v3/pumpfun_33m/pumpfun_execution_stress.json').write_text(json.dumps(out,indent=2))
+          print(json.dumps(out,indent=2))
+          PY
       - name: Publish Pump.fun OOS metrics
         if: always()
         run: |
@@ -154,25 +277,99 @@ jobs:
             artifacts/v3/pumpfun_33m/oos/v3_oos_trades.parquet
             artifacts/v3/pumpfun_33m/oos/v3_oos_report.json
             artifacts/v3/pumpfun_33m/v3_train_summary.json
+            artifacts/v3/pumpfun_33m/pumpfun_execution_stress.json
             artifacts/v3/pumpfun_liquidity_report.json
             artifacts_pumpfun_build.log
           if-no-files-found: warn
           retention-days: 30
 
+  combined-oos:
+    needs: [preflight, legacy-replay, pumpfun-oos]
+    if: needs.preflight.outputs.legacy_found == 'true' && needs.legacy-replay.result == 'success' && needs.pumpfun-oos.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e '.[v3]'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: latoken-legacy-replay-*
+          path: downloaded/combined/latoken
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pumpfun-v3-33m-oos-*
+          path: downloaded/combined/pumpfun
+          merge-multiple: true
+      - name: Build one chronological COMBINED_OOS ledger and verdict
+        shell: bash
+        run: |
+          set -euo pipefail
+          LTRADES="$(find downloaded/combined/latoken -name latoken_legacy_oos_trades.parquet | head -1)"
+          LPRED="$(find downloaded/combined/latoken -name legacy_oos_predictions.parquet | head -1)"
+          LSTRESS="$(find downloaded/combined/latoken -name latoken_legacy_execution_stress.json | head -1)"
+          LMETRICS="$(find downloaded/combined/latoken -name legacy_oos_metrics.json | head -1 || true)"
+          PTRADES="$(find downloaded/combined/pumpfun -name v3_oos_trades.parquet | head -1)"
+          PPRED="$(find downloaded/combined/pumpfun -name v3_oos_predictions.parquet | head -1)"
+          PSTRESS="$(find downloaded/combined/pumpfun -name pumpfun_execution_stress.json | head -1)"
+          PMETRICS="$(find downloaded/combined/pumpfun -name v3_oos_report.json | head -1)"
+          EXTRA=()
+          if [ -n "$LMETRICS" ]; then EXTRA+=(--latoken-metrics "$LMETRICS"); fi
+          python scripts/v3_combine_oos.py \
+            --latoken-trades "$LTRADES" \
+            --pumpfun-trades "$PTRADES" \
+            --latoken-predictions "$LPRED" \
+            --pumpfun-predictions "$PPRED" \
+            "${EXTRA[@]}" \
+            --pumpfun-metrics "$PMETRICS" \
+            --latoken-execution-stress "$LSTRESS" \
+            --pumpfun-execution-stress "$PSTRESS" \
+            --evaluation-equity-usd "$EVALUATION_EQUITY_USD" \
+            --latoken-target legacy_future_pump \
+            --pumpfun-target tp_before_sl \
+            --out artifacts/combined_oos
+          python - <<'PY'
+          import json
+          r=json.load(open('artifacts/combined_oos/combined_oos_report.json'))
+          f=r.get('financial',{}); v=r.get('verdict',{})
+          print('\nCOMBINED_OOS FINAL')
+          for k in ('trades','net_pnl_usd','expectancy_usd','profit_factor','max_drawdown_usd','sharpe_per_trade','win_rate'):
+              print(f'{k}={f.get(k)}')
+          print('recommended_stage=',v.get('recommended_stage'))
+          print('historical_gate_passed=',v.get('historical_gate_passed'))
+          print('canary_eligible=',v.get('canary_eligible'))
+          print('shadow_reasons=',v.get('shadow_reasons'))
+          with open(__import__('os').environ['GITHUB_STEP_SUMMARY'],'a') as s:
+              s.write('\n## FINAL COMBINED_OOS VERDICT\n\n```json\n')
+              s.write(json.dumps({'financial':f,'verdict':v,'winner_robustness':r.get('winner_robustness')},indent=2))
+              s.write('\n```\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: COMBINED_OOS-${{ github.run_id }}
+          path: artifacts/combined_oos/
+          if-no-files-found: error
+          retention-days: 30
+
   evidence-status:
     if: always()
-    needs: [preflight, pumpfun-oos]
+    needs: [preflight, legacy-replay, pumpfun-oos, combined-oos]
     runs-on: ubuntu-latest
     steps:
-      - name: Emit fail-closed evidence verdict
+      - name: Emit fail-closed pipeline status
         run: |
           echo '## COMBINED_OOS evidence status' >> "$GITHUB_STEP_SUMMARY"
           echo "legacy_found=${{ needs.preflight.outputs.legacy_found }}" >> "$GITHUB_STEP_SUMMARY"
           echo "legacy_artifact=${{ needs.preflight.outputs.legacy_artifact_name }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "legacy_run_id=${{ needs.preflight.outputs.legacy_run_id }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "pumpfun_job=${{ needs.pumpfun-oos.result }}" >> "$GITHUB_STEP_SUMMARY"
-          if [ "${{ needs.preflight.outputs.legacy_found }}" != "true" ] || [ "${{ needs.pumpfun-oos.result }}" != "success" ]; then
-            echo 'VERDICT=BLOCKED (insufficient executable OOS evidence; never promote)' >> "$GITHUB_STEP_SUMMARY"
+          echo "legacy_replay=${{ needs.legacy-replay.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "pumpfun_33m=${{ needs.pumpfun-oos.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "combined=${{ needs.combined-oos.result }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.combined-oos.result }}" != "success" ]; then
+            echo 'VERDICT=BLOCKED — no promotion; executable COMBINED_OOS evidence is incomplete' >> "$GITHUB_STEP_SUMMARY"
           else
-            echo 'VERDICT=READY_FOR_COMBINED_REPLAY (historical evidence exists; canary still requires live shadow gate)' >> "$GITHUB_STEP_SUMMARY"
+            echo 'VERDICT=READ artifacts/combined_oos/combined_oos_report.json — historical gate may permit SHADOW only; CANARY still requires 300 trades / 30 live shadow days' >> "$GITHUB_STEP_SUMMARY"
           fi
