@@ -102,8 +102,13 @@ def trades_to_panel(
             "current_vtokens": g["current_vtokens"].dropna().iloc[-1] if g["current_vtokens"].notna().any() else np.nan,
         })
 
-    panel = d.groupby(["symbol", "bucket"], sort=False).apply(agg, include_groups=False).reset_index()
-    panel = panel.rename(columns={"bucket": "timestamp"})
+    grouped_rows: list[dict[str, Any]] = []
+    for (symbol, bucket), g in d.groupby(["symbol", "bucket"], sort=False):
+        row = agg(g).to_dict()
+        row["symbol"] = symbol
+        row["timestamp"] = bucket
+        grouped_rows.append(row)
+    panel = pd.DataFrame(grouped_rows)
 
     full: list[pd.DataFrame] = []
     for symbol, g in panel.groupby("symbol", sort=False):
