@@ -12,8 +12,11 @@ RESERVE_CANDIDATES = (
     "virtual_sol_reserves",
     "virtual_sol_reserve",
     "v_sol_reserves",
+    "virtual_sol_reserve_lamports",
 )
-TIMESTAMP_CANDIDATES = ("timestamp", "trade_time", "block_time", "event_time", "created_at", "time")
+TIMESTAMP_CANDIDATES = ("timestamp", "trade_time", "block_time", "event_time", "created_at", "time", "snapshot_time")
+RELATIVE_TIME_CANDIDATES = ("seconds_since_launch", "seconds_since_creation", "age_seconds", "token_age_seconds")
+LAUNCH_TIME_CANDIDATES = ("created_at", "launch_time", "launched_at", "first_seen_at", "created_timestamp", "timestamp")
 
 
 def _duckdb():
@@ -32,6 +35,23 @@ def _first(columns: set[str], candidates: tuple[str, ...]) -> str | None:
     return next((c for c in candidates if c in columns), None)
 
 
+def _timestamp_expression(source_cols: set[str], token_cols: set[str]) -> tuple[str, bool, str]:
+    direct = _first(source_cols, TIMESTAMP_CANDIDATES)
+    if direct:
+        return f"CAST(s.{direct} AS TIMESTAMPTZ)", False, direct
+    relative = _first(source_cols, RELATIVE_TIME_CANDIDATES)
+    launch = _first(token_cols, LAUNCH_TIME_CANDIDATES)
+    if relative and launch:
+        return (
+            f"CAST(k.{launch} AS TIMESTAMPTZ) + CAST(s.{relative} AS DOUBLE) * INTERVAL 1 SECOND",
+            True,
+            f"{launch}+{relative}",
+        )
+    raise ValueError(
+        "Cannot derive absolute liquidity timestamp: expected direct timestamp or launch timestamp + relative seconds"
+    )
+
+
 def _read_prices(path: Path) -> pd.DataFrame:
     d = pd.read_parquet(path) if path.suffix.lower() in {".parquet", ".pq"} else pd.read_csv(path)
     timestamp = next((c for c in ("timestamp", "time", "datetime", "date") if c in d.columns), None)
@@ -47,29 +67,44 @@ def _read_prices(path: Path) -> pd.DataFrame:
     return out
 
 
+def _select_curve_source(con, corpus_dir: Path) -> tuple[str, str, set[str]]:
+    candidates = []
+    trades = corpus_dir / "trades"
+    if list(trades.glob("*.parquet")):
+        candidates.append(("trades", str(trades / "*.parquet").replace("'", "''")))
+    snapshots = corpus_dir / "snapshots.parquet"
+    if snapshots.exists():
+        candidates.append(("snapshots", str(snapshots).replace("'", "''")))
+    diagnostics: dict[str, list[str]] = {}
+    for name, parquet in candidates:
+        cols = _columns(con, parquet)
+        diagnostics[name] = sorted(cols)
+        if _first(cols, RESERVE_CANDIDATES):
+            return name, parquet, cols
+    raise ValueError(f"No bonding-curve SOL reserve column found in trades or snapshots. Schemas={diagnostics}")
+
+
 def enrich(panel_path: Path, corpus_dir: Path, sol_usd_path: Path, output_path: Path, report_path: Path) -> dict:
     duckdb = _duckdb()
-    trades_glob = str(corpus_dir / "trades" / "*.parquet").replace("'", "''")
-    if not list((corpus_dir / "trades").glob("*.parquet")):
-        raise FileNotFoundError("No trades/*.parquet shards found")
+    tokens_path = corpus_dir / "tokens.parquet"
+    if not tokens_path.exists():
+        raise FileNotFoundError("tokens.parquet is required for robust point-in-time liquidity reconstruction")
 
     con = duckdb.connect(database=":memory:")
-    trade_cols = _columns(con, trades_glob)
-    reserve_col = _first(trade_cols, RESERVE_CANDIDATES)
-    ts_col = _first(trade_cols, TIMESTAMP_CANDIDATES)
-    if reserve_col is None:
-        raise ValueError(f"No bonding-curve SOL reserve column found. Available columns: {sorted(trade_cols)}")
-    if ts_col is None:
-        raise ValueError(f"No direct trade timestamp found for liquidity enrichment. Available columns: {sorted(trade_cols)}")
+    source_name, source_path, source_cols = _select_curve_source(con, corpus_dir)
+    token_path_sql = str(tokens_path).replace("'", "''")
+    token_cols = _columns(con, token_path_sql)
+    reserve_col = _first(source_cols, RESERVE_CANDIDATES)
+    assert reserve_col is not None
+    ts_expr, needs_token_join, timestamp_source = _timestamp_expression(source_cols, token_cols)
+    token_join = f"JOIN read_parquet('{token_path_sql}') k USING (mint)" if needs_token_join else ""
 
     median_raw = con.execute(
-        f"SELECT median(CAST({reserve_col} AS DOUBLE)) FROM read_parquet('{trades_glob}') WHERE {reserve_col} IS NOT NULL AND CAST({reserve_col} AS DOUBLE) > 0"
+        f"SELECT median(CAST(s.{reserve_col} AS DOUBLE)) FROM read_parquet('{source_path}') s WHERE s.{reserve_col} IS NOT NULL AND CAST(s.{reserve_col} AS DOUBLE) > 0"
     ).fetchone()[0]
     if median_raw is None or float(median_raw) <= 0:
         raise ValueError(f"Bonding-curve reserve column {reserve_col} has no positive values")
     median_raw = float(median_raw)
-    # Pump.fun on-chain virtual SOL reserve is normally stored in lamports. Fail closed
-    # on ambiguous magnitudes instead of silently labelling an unknown unit as USD.
     if median_raw >= 1_000_000:
         reserve_scale = 1e9
         reserve_unit = "lamports"
@@ -86,12 +121,21 @@ def enrich(panel_path: Path, corpus_dir: Path, sol_usd_path: Path, output_path: 
 
     reserve = con.execute(
         f"""
+        WITH curve AS (
+            SELECT
+                CAST(s.mint AS VARCHAR) AS symbol,
+                {ts_expr} AS event_timestamp,
+                CAST(s.{reserve_col} AS DOUBLE) / {reserve_scale} AS liquidity_sol
+            FROM read_parquet('{source_path}') s
+            {token_join}
+            WHERE s.{reserve_col} IS NOT NULL AND CAST(s.{reserve_col} AS DOUBLE) > 0
+        )
         SELECT
-            CAST(mint AS VARCHAR) AS symbol,
-            time_bucket(INTERVAL '5 minutes', CAST({ts_col} AS TIMESTAMPTZ)) AS timestamp,
-            arg_max(CAST({reserve_col} AS DOUBLE), CAST({ts_col} AS TIMESTAMPTZ)) / {reserve_scale} AS liquidity_sol
-        FROM read_parquet('{trades_glob}')
-        WHERE {reserve_col} IS NOT NULL AND CAST({reserve_col} AS DOUBLE) > 0
+            symbol,
+            time_bucket(INTERVAL '5 minutes', event_timestamp) AS timestamp,
+            arg_max(liquidity_sol, event_timestamp) AS liquidity_sol
+        FROM curve
+        WHERE event_timestamp IS NOT NULL
         GROUP BY symbol, timestamp
         ORDER BY timestamp, symbol
         """
@@ -101,13 +145,12 @@ def enrich(panel_path: Path, corpus_dir: Path, sol_usd_path: Path, output_path: 
     reserve["liquidity_sol"] = pd.to_numeric(reserve["liquidity_sol"], errors="coerce")
 
     prices = _read_prices(sol_usd_path)
-    # Point-in-time price: use only the latest SOL/USD observation at or before the bar.
     price_for_bars = pd.merge_asof(
         panel[["timestamp"]].drop_duplicates().sort_values("timestamp"),
         prices,
         on="timestamp",
         direction="backward",
-        tolerance=pd.Timedelta("6h"),
+        tolerance=pd.Timedelta("10min"),
     )
     panel = panel.merge(reserve, on=["timestamp", "symbol"], how="left", validate="one_to_one")
     panel = panel.merge(price_for_bars, on="timestamp", how="left", validate="many_to_one")
@@ -119,13 +162,15 @@ def enrich(panel_path: Path, corpus_dir: Path, sol_usd_path: Path, output_path: 
     if coverage < 0.95:
         raise ValueError(
             f"liquidity_usd coverage {coverage:.3%} is below required 95%; "
-            f"price coverage={price_coverage:.3%}, reserve_col={reserve_col}"
+            f"price coverage={price_coverage:.3%}, source={source_name}, reserve_col={reserve_col}"
         )
 
     vals = panel.loc[finite, "liquidity_usd"]
     diagnostics = {
         "rows": int(len(panel)),
+        "curve_source": source_name,
         "reserve_column": reserve_col,
+        "timestamp_source": timestamp_source,
         "reserve_raw_median": median_raw,
         "reserve_raw_unit": reserve_unit,
         "reserve_scale_to_sol": reserve_scale,
