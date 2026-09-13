@@ -16,8 +16,8 @@ LAMPORTS_PER_SOL = 1_000_000_000
 
 @dataclass(frozen=True, slots=True)
 class ShadowStrategyConfig:
-    probability_column: str = "pump_probability__20pct_1h"
-    horizon: str = "20pct_1h"
+    probability_column: str = "pump_probability__tp20_sl08_1h"
+    horizon: str = "tp20_sl08_1h"
     min_probability: float = 0.70
     top_k: int = 10
     requested_notional_usd: float = 50.0
@@ -26,7 +26,7 @@ class ShadowStrategyConfig:
     max_hold_minutes: int = 60
     slippage_bps: int = 100
     min_quote_out_lamports: int = 1
-    model_version: str = "v2"
+    model_version: str = "v3"
 
 
 @dataclass(slots=True)
@@ -44,6 +44,24 @@ class ShadowSignalEngine:
             return abs(float(quote.get("priceImpactPct", 0.0))) * 10_000.0
         except (TypeError, ValueError):
             return float("inf")
+
+    @staticmethod
+    def _conservative_liquidity_usd(
+        observed_liquidity_usd: float,
+        requested_notional_usd: float,
+        impact_bps: float,
+    ) -> float:
+        observed = observed_liquidity_usd if np.isfinite(observed_liquidity_usd) and observed_liquidity_usd > 0 else np.nan
+        # For a locally linear AMM, impact is approximately proportional to size/depth.
+        # Use coefficient 0.5 (same conservative convention as the backtester).
+        implied = (
+            requested_notional_usd * 5_000.0 / max(impact_bps, 1e-9)
+            if np.isfinite(impact_bps) and impact_bps > 0
+            else float("inf")
+        )
+        if np.isfinite(observed):
+            return float(min(observed, implied)) if np.isfinite(implied) else float(observed)
+        return float(implied)
 
     def candidates(self, ranking: pd.DataFrame) -> pd.DataFrame:
         if ranking.empty:
@@ -104,9 +122,11 @@ class ShadowSignalEngine:
             )
             impact_bps = self._impact_bps(quote)
             out_amount = int(quote.get("outAmount") or 0)
-            liquidity_usd = float(payload.get(liquidity_column) or np.nan)
-            # Jupiter route availability is a hard executability gate. Liquidity
-            # remains an independent risk input from the point-in-time panel.
+            try:
+                observed_liquidity = float(payload.get(liquidity_column))
+            except (TypeError, ValueError):
+                observed_liquidity = float("nan")
+            liquidity_usd = self._conservative_liquidity_usd(observed_liquidity, requested, impact_bps)
             if out_amount < self.config.min_quote_out_lamports:
                 continue
             decision = self.risk.evaluate(
@@ -145,6 +165,7 @@ class ShadowSignalEngine:
                 "entry_sol": approved_lamports / LAMPORTS_PER_SOL,
                 "entry_usd": decision.notional_usd,
                 "entry_impact_bps": impact_bps,
+                "effective_liquidity_usd": liquidity_usd,
                 "entry_quote": quote,
                 "probability": probability,
                 "tp_return": self.config.tp_return,
