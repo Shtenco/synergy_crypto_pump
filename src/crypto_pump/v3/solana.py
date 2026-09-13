@@ -5,9 +5,14 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import pandas as pd
+
+SOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+LAMPORTS_PER_SOL = 1_000_000_000
+USDC_ATOMIC = 1_000_000
 
 
 def _json_request(url: str, *, payload: dict | None = None, timeout: int = 20) -> Any:
@@ -33,8 +38,57 @@ class SolanaRPC:
             raise RuntimeError(f"Solana RPC error: {result['error']}")
         return result.get("result")
 
-    def recent_signatures(self, address: str, limit: int = 100) -> list[dict]:
-        return self.call("getSignaturesForAddress", [address, {"limit": int(limit)}]) or []
+    def recent_signatures(
+        self,
+        address: str,
+        limit: int = 100,
+        *,
+        before: str | None = None,
+        until: str | None = None,
+    ) -> list[dict]:
+        opts: dict[str, Any] = {"limit": min(1000, int(limit))}
+        if before:
+            opts["before"] = before
+        if until:
+            opts["until"] = until
+        return self.call("getSignaturesForAddress", [address, opts]) or []
+
+    def iter_signatures(
+        self,
+        address: str,
+        *,
+        max_signatures: int = 10_000,
+        page_size: int = 1000,
+        until: str | None = None,
+        sleep_s: float = 0.0,
+    ) -> Iterator[dict]:
+        before = None
+        emitted = 0
+        seen: set[str] = set()
+        while emitted < max_signatures:
+            page = self.recent_signatures(
+                address,
+                min(page_size, max_signatures - emitted),
+                before=before,
+                until=until,
+            )
+            if not page:
+                break
+            for item in page:
+                sig = item.get("signature")
+                if not sig or sig in seen:
+                    continue
+                seen.add(sig)
+                emitted += 1
+                yield item
+                if emitted >= max_signatures:
+                    break
+            last = page[-1].get("signature")
+            if not last or last == before or len(page) < min(page_size, max_signatures - emitted + len(page)):
+                break
+            before = last
+            if sleep_s:
+                time.sleep(sleep_s)
 
     def transaction(self, signature: str) -> dict | None:
         return self.call(
@@ -44,7 +98,7 @@ class SolanaRPC:
 
     def wallet_transactions(self, address: str, limit: int = 100, sleep_s: float = 0.0) -> pd.DataFrame:
         rows = []
-        for item in self.recent_signatures(address, limit=limit):
+        for item in self.iter_signatures(address, max_signatures=limit, sleep_s=sleep_s):
             sig = item.get("signature")
             if not sig:
                 continue
@@ -82,6 +136,18 @@ class JupiterQuoteClient:
             "slippageBps": int(slippage_bps),
         })
         return _json_request(f"{self.base_url}/quote?{query}")
+
+    def sol_usd_price(self, *, slippage_bps: int = 50) -> float:
+        quote = self.quote(
+            input_mint=SOL_MINT,
+            output_mint=USDC_MINT,
+            amount_atomic=LAMPORTS_PER_SOL,
+            slippage_bps=slippage_bps,
+        )
+        out = int(quote.get("outAmount") or 0)
+        if out <= 0:
+            raise RuntimeError("Jupiter returned no executable SOL/USDC output")
+        return out / USDC_ATOMIC
 
 
 @dataclass(slots=True)
