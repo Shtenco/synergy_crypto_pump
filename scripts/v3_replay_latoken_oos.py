@@ -22,8 +22,6 @@ def _quote_turnover_usd(panel: pd.DataFrame) -> pd.Series:
     for col in ("quote_volume_usd", "quote_volume", "turnover_usd", "turnover"):
         if col in panel.columns:
             return pd.to_numeric(panel[col], errors="coerce")
-    # LATOKEN source shards are USDT-market OHLCV. For sources that only carry
-    # base volume, close*volume is an auditable causal turnover proxy.
     return pd.to_numeric(panel["close"], errors="coerce") * pd.to_numeric(panel["volume"], errors="coerce")
 
 
@@ -31,14 +29,10 @@ def _prepare_market(panel: pd.DataFrame, *, liquidity_fraction: float) -> pd.Dat
     d = panel.copy()
     d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True, errors="coerce")
     d = d.dropna(subset=["timestamp", "symbol", "close"]).sort_values(["symbol", "timestamp"], kind="mergesort")
-    # A common USD execution ledger is only valid for USD/USDT quoted markets.
     is_usdt = d["symbol"].astype(str).str.upper().str.contains("USDT")
     d = d[is_usdt].copy()
     turnover = _quote_turnover_usd(d).clip(lower=0)
     d["quote_turnover_usd"] = turnover
-    # No L2 book was archived in the legacy run. Never label 5m turnover as
-    # literal order-book depth: use an explicit conservative fraction of the
-    # trailing one-hour turnover as a capacity proxy and report it as such.
     trailing = (
         d.assign(_turnover=turnover)
         .groupby("symbol", sort=False)["_turnover"]
@@ -53,11 +47,13 @@ def _prepare_market(panel: pd.DataFrame, *, liquidity_fraction: float) -> pd.Dat
 def _score_columns(pred: pd.DataFrame) -> list[tuple[object, str]]:
     found = []
     for spec in DEFAULT_HORIZONS:
-        col = f"pump_probability__{spec.name}"
-        if col in pred.columns:
+        candidates = (f"pump_probability__{spec.name}", f"p__{spec.name}")
+        col = next((c for c in candidates if c in pred.columns), None)
+        if col is not None:
             found.append((spec, col))
     if not found:
-        raise ValueError("No frozen V2 pump_probability__* columns found in legacy OOS predictions")
+        available = sorted(c for c in pred.columns if c.startswith(("pump_probability__", "p__")))
+        raise ValueError(f"No supported frozen V2 probability columns found; available={available}")
     return found
 
 
@@ -82,10 +78,9 @@ def _signal_market(
     keys = pd.MultiIndex.from_frame(out[["timestamp", "symbol"]])
     out["signal"] = lookup.reindex(keys, fill_value=False).to_numpy(bool)
     out["notional_usd"] = float(notional_usd)
-    # Frozen legacy prediction targets are max-return-within-horizon, but the
-    # artifact does not contain an ordered TP/SL path. A fixed-horizon close is
-    # therefore the only non-lookahead executable replay that does not invent
-    # a hit time from MFE/MAE.
+    # The frozen legacy artifacts contain future-MFE labels but do not preserve
+    # an ordered intrahorizon price path. A fixed-horizon close is intentionally
+    # used so replay never invents a TP/SL hit time from future summaries.
     out["exit_bar"] = int(spec.horizon_bars)
     return out
 
@@ -165,14 +160,7 @@ def replay(
         min_liquidity_usd=1_000.0,
         max_impact_bps=100.0,
     )
-    trades, markets = _run_all(
-        panel,
-        pred,
-        costs=costs,
-        threshold=threshold,
-        top_k=top_k,
-        notional_usd=notional_usd,
-    )
+    trades, markets = _run_all(panel, pred, costs=costs, threshold=threshold, top_k=top_k, notional_usd=notional_usd)
     execution_stress = _scenario_metrics(markets, costs)
 
     capacity = []
@@ -188,6 +176,7 @@ def replay(
         "costs_x2_latency_x2_net_pnl_usd": execution_stress.get("costs_x2_latency_x2", {}).get("net_pnl_usd"),
     }
     (output_dir / "latoken_legacy_execution_stress.json").write_text(json.dumps(simplified_stress, indent=2), encoding="utf-8")
+    score_columns = [c for _, c in _score_columns(pred)]
     report = {
         "source": "frozen_legacy_v2_oos_predictions",
         "retrained": False,
@@ -212,7 +201,7 @@ def replay(
         "winner_stress": stress_test_trades(trades),
         "execution_stress": execution_stress,
         "capacity": capacity,
-        "score_columns": [c for _, c in _score_columns(pred)],
+        "score_columns": score_columns,
     }
     (output_dir / "latoken_legacy_execution_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     return report
