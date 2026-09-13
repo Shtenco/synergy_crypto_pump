@@ -15,6 +15,7 @@ from crypto_pump.v3.panel import normalize_pumpportal_trades, trades_to_panel
 from crypto_pump.v3.risk import RiskManager
 from crypto_pump.v3.solana import JupiterQuoteClient
 from crypto_pump.v3.store import V3Store
+from crypto_pump.v3.wallet_features import enrich_panel_with_wallet_features
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,6 +61,7 @@ def cycle(args: argparse.Namespace, model, store: V3Store, quote: JupiterQuoteCl
 
     sol_usd = quote.sol_usd_price()
     panel = trades_to_panel(trades, sol_usd=sol_usd)
+    panel = enrich_panel_with_wallet_features(panel, trades)
     panel = panel.dropna(subset=["open", "high", "low", "close"])
     if panel.empty:
         report = {"status": "no_complete_bars", "trades": len(trades)}
