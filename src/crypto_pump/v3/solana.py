@@ -66,12 +66,8 @@ class SolanaRPC:
         emitted = 0
         seen: set[str] = set()
         while emitted < max_signatures:
-            page = self.recent_signatures(
-                address,
-                min(page_size, max_signatures - emitted),
-                before=before,
-                until=until,
-            )
+            requested = min(page_size, max_signatures - emitted)
+            page = self.recent_signatures(address, requested, before=before, until=until)
             if not page:
                 break
             for item in page:
@@ -84,7 +80,7 @@ class SolanaRPC:
                 if emitted >= max_signatures:
                     break
             last = page[-1].get("signature")
-            if not last or last == before or len(page) < min(page_size, max_signatures - emitted + len(page)):
+            if not last or last == before or len(page) < requested:
                 break
             before = last
             if sleep_s:
