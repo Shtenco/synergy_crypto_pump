@@ -174,3 +174,36 @@ Architecture details: [`docs/V2_ARCHITECTURE.md`](docs/V2_ARCHITECTURE.md).
 ## Current status
 
 **V2 implements the multi-branch training architecture and leakage controls.** The next empirical stage is collecting a point-in-time dataset large enough to train all branches, then running the frozen V2 protocol across exchanges/launchpads and measuring whether each branch contributes incremental OOS Top-K value after realistic costs.
+
+
+<!-- SYNERGY-FEDERATION-PASSPORT:START -->
+---
+
+## 🧭 SYNERGY federation passport
+
+**Домен:** 📈 Crypto ML research  
+**Архитектурный родитель:** [`synergy_midas_ai`](https://github.com/Shtenco/synergy_midas_ai)  
+**Архитектурный корень:** [`synergy_system`](https://github.com/Shtenco/synergy_system)
+
+```mermaid
+flowchart LR
+    SYS[🧭 synergy_system] --> P[synergy_midas_ai]
+    P --> THIS[synergy_crypto_pump]
+    THIS --> E[📦 Evidence / outputs]
+```
+
+### Документационный контракт
+
+README должен показывать: проблему → архитектуру → реальные артефакты → проверку → ограничения → связи с федерацией. Сильные claims без evidence остаются R&D/CANDIDATE.
+
+### Навигация
+
+- [📚 Атлас всех 75 репозиториев](https://github.com/Shtenco/synergy_system/blob/main/docs/SYNERGY_REPOSITORY_ATLAS.md)
+- [🧾 Машиночитаемый registry](https://github.com/Shtenco/synergy_system/blob/main/registry/SYNERGY_REPOSITORIES.json)
+- [🧭 SYNERGY SYSTEM](https://github.com/Shtenco/synergy_system)
+
+### Authority rule
+
+Репозиторий не присваивает полномочия соседнего домена: AI ≠ authorization, UI ≠ ledger, blockchain commitment ≠ accounting truth, backtest ≠ realized external P&L.
+
+<!-- SYNERGY-FEDERATION-PASSPORT:END -->
