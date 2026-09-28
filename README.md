@@ -207,3 +207,39 @@ README должен показывать: проблему → архитект�
 Репозиторий не присваивает полномочия соседнего домена: AI ≠ authorization, UI ≠ ledger, blockchain commitment ≠ accounting truth, backtest ≠ realized external P&L.
 
 <!-- SYNERGY-FEDERATION-PASSPORT:END -->
+
+---
+
+# 🚀 Глубокий доказательный паспорт Crypto Pump V2
+
+## Реальная зрелость
+
+Это уже structured ML research stack с point-in-time target design, purged walk-forward, causal feature guardrails, real-data builders, falsification tests и множеством CI workflows.
+
+```mermaid
+flowchart LR
+    CEX[CEX data] --> FS[Causal feature store]
+    DEX[DEX/wallet] --> FS
+    SOC[Social/news] --> FS
+    FS --> BR[Model branches]
+    BR --> STACK[Validation-only stacker]
+    STACK --> CAL[Calibration]
+    CAL --> RANK[Per-time Top-K]
+    RANK --> OOS[Purged walk-forward OOS]
+```
+
+## Главная market-structure граница
+
+Pump markets adversarial/manipulated; ranking metric ≠ executable alpha. Point-in-time universe, delistings, liquidity, spread, slippage, impact, latency и survivor bias обязательны.
+
+## Evidence anchors
+
+- `tests/test_v2_feature_guardrails.py`;
+- `tests/test_v2_splits.py`;
+- `tests/test_v2_falsification.py`;
+- `docs/UPSTREAM_AUDIT_V2.md`;
+- real-data/large-data CI workflows.
+
+## Следующий рубеж
+
+frozen real universe snapshots → delisting/survivor controls → order-book liquidity execution model → untouched chronological OOS → shadow rank-to-fill study.
