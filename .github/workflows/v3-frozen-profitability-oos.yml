@@ -1,0 +1,119 @@
+name: V3 FROZEN PROFITABILITY OOS
+
+on:
+  push:
+    branches: [v3-profitability-audit-hardening]
+    paths:
+      - ".github/workflows/v3-frozen-profitability-oos.yml"
+      - "scripts/v3_frozen_profitability_oos.py"
+      - "scripts/v3_regularize_5m.py"
+      - "src/crypto_pump/v3/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  HF_HUB_ENABLE_HF_TRANSFER: "0"
+
+jobs:
+  frozen-oos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install frozen test stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[v3,dev]'
+          python -m compileall -q src scripts
+          pytest -q tests/test_v3_metrics.py tests/test_v3_labels.py tests/test_v3_execution_risk.py
+      - name: Download and clean Pump.fun corpus
+        run: |
+          mkdir -p artifacts/frozen_oos
+          python scripts/v3_build_historical_corpus.py \
+            --data-dir data/v3/hf_pumpfun_corpus \
+            --output data/v3/pumpfun_historical_5m_sparse.parquet \
+            --threads 4 \
+            --memory-limit 7GB \
+            | tee artifacts/frozen_oos/corpus_build.json
+      - name: Download historical SOL/USD
+        run: |
+          python scripts/v3_download_sol_usd.py \
+            --panel data/v3/pumpfun_historical_5m_sparse.parquet \
+            --output data/v3/sol_usd_5m.parquet
+      - name: Attach point-in-time bonding-curve liquidity
+        run: |
+          python scripts/v3_enrich_pumpfun_liquidity.py \
+            --panel data/v3/pumpfun_historical_5m_sparse.parquet \
+            --corpus-dir data/v3/hf_pumpfun_corpus \
+            --sol-usd data/v3/sol_usd_5m.parquet \
+            --output data/v3/pumpfun_sparse_liquidity.parquet \
+            --report artifacts/frozen_oos/liquidity_report.json
+      - name: Regularize to exact 5-minute grid
+        run: |
+          python scripts/v3_regularize_5m.py \
+            --source data/v3/pumpfun_sparse_liquidity.parquet \
+            --output data/v3/pumpfun_exact_5m.parquet \
+            --report artifacts/frozen_oos/regularization_report.json \
+            --threads 4 \
+            --memory-limit 7GB
+      - name: Retrain only before OOS and freeze
+        run: |
+          python scripts/v3_frozen_profitability_oos.py \
+            data/v3/pumpfun_exact_5m.parquet \
+            artifacts/frozen_oos/result \
+            --threshold 0.70 \
+            --top-k 10 \
+            --notional-usd 50 \
+            --initial-equity-usd 5000 \
+            | tee artifacts/frozen_oos/final_stdout.json
+      - name: Publish exact final metrics
+        if: always()
+        run: |
+          if [ -f artifacts/frozen_oos/result/frozen_oos_report.json ]; then
+            python - <<'PY'
+          import json, os
+          p='artifacts/frozen_oos/result/frozen_oos_report.json'
+          r=json.load(open(p))
+          f=r.get('financial',{})
+          s=r.get('execution_stress',{})
+          w=r.get('winner_stress',{})
+          summary={
+            'Trades':f.get('trades'),
+            'Net PnL':f.get('net_pnl_usd'),
+            'PnL %':f.get('pnl_pct_initial_equity'),
+            'Expectancy':f.get('expectancy_usd'),
+            'Win rate':f.get('win_rate'),
+            'Profit Factor':f.get('profit_factor'),
+            'Max DD':f.get('max_drawdown_usd'),
+            'Sharpe':f.get('sharpe_per_trade'),
+            'average holding time':f.get('average_holding_minutes'),
+            'costs×2 PnL':(s.get('costs_x2') or {}).get('net_pnl_usd'),
+            'latency×2 PnL':(s.get('latency_x2') or {}).get('net_pnl_usd'),
+            'top-1% removed PnL':(w.get('remove_top_1pct') or {}).get('net_pnl_usd'),
+            'historical_gate_passed':r.get('historical_gate_passed'),
+          }
+          print(json.dumps(summary,indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as fh:
+              fh.write('## FROZEN SINGLE OOS FINAL\\n\\n')
+              fh.write(json.dumps(summary,indent=2))
+              fh.write('\\n')
+          PY
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v3-frozen-profitability-oos-\${{ github.run_id }}
+          path: artifacts/frozen_oos/
+          if-no-files-found: warn
+          retention-days: 30
