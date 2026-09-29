@@ -40,6 +40,11 @@ def main() -> None:
     ap.add_argument("--latoken-execution-stress", help="JSON with at least costs_x2_net_pnl_usd")
     ap.add_argument("--pumpfun-execution-stress", help="JSON with at least costs_x2_net_pnl_usd")
     ap.add_argument("--evaluation-equity-usd", type=float, required=True, help="Equity denominator used by the max-DD promotion gate")
+    ap.add_argument(
+        "--pumpfun-horizon",
+        default=None,
+        help="Predeclared single Pump.fun trading horizon. Required when the OOS ledger contains multiple horizons; horizons are never pooled into one PnL.",
+    )
     ap.add_argument("--latoken-target", default="legacy_future_pump")
     ap.add_argument("--pumpfun-target", default="tp_before_sl")
     ap.add_argument("--target-col", default="y_true")
@@ -49,7 +54,21 @@ def main() -> None:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    trade_sources = {"latoken_legacy": read_table(args.latoken_trades), "pumpfun_33m": read_table(args.pumpfun_trades)}
+    latoken_trades = read_table(args.latoken_trades)
+    pumpfun_trades = read_table(args.pumpfun_trades)
+    if "horizon" in pumpfun_trades.columns:
+        horizons = sorted(str(x) for x in pumpfun_trades["horizon"].dropna().unique())
+        if len(horizons) > 1 and not args.pumpfun_horizon:
+            raise SystemExit(
+                "Pump.fun OOS contains multiple horizons; refuse to pool them into one profitability verdict. "
+                "Pass --pumpfun-horizon with a horizon predeclared before reading its PnL. "
+                f"available={horizons}"
+            )
+        if args.pumpfun_horizon:
+            if args.pumpfun_horizon not in horizons:
+                raise SystemExit(f"Unknown --pumpfun-horizon={args.pumpfun_horizon}; available={horizons}")
+            pumpfun_trades = pumpfun_trades[pumpfun_trades["horizon"].astype(str).eq(args.pumpfun_horizon)].copy()
+    trade_sources = {"latoken_legacy": latoken_trades, "pumpfun_33m": pumpfun_trades}
     trades = combine_oos_trades(trade_sources)
     trades.to_parquet(out / "combined_oos_trades.parquet", index=False)
 
