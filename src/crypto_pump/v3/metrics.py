@@ -14,10 +14,22 @@ def financial_report(trades: pd.DataFrame) -> dict[str, float | int | None]:
     if x.empty or "net_pnl_usd" not in x:
         return {"trades": 0}
 
+    # PnL path must be chronological. Without this, pooled folds/horizons can
+    # manufacture an incorrect drawdown simply from dataframe append order.
+    time_col = next(
+        (c for c in ("exit_timestamp", "entry_timestamp", "signal_timestamp", "timestamp") if c in x.columns),
+        None,
+    )
+    if time_col is not None:
+        x[time_col] = pd.to_datetime(x[time_col], utc=True, errors="coerce")
+        x = x.sort_values(time_col, kind="stable", na_position="last").reset_index(drop=True)
+
     pnl = pd.to_numeric(x["net_pnl_usd"], errors="coerce").fillna(0.0)
     ret = pd.to_numeric(x.get("net_return", 0.0), errors="coerce").fillna(0.0)
     equity = pnl.cumsum()
-    peak = equity.cummax()
+    # Include the pre-trade equity/PnL baseline at 0. A first losing trade must
+    # create drawdown instead of becoming its own (negative) high-water mark.
+    peak = equity.cummax().clip(lower=0.0)
     drawdown = equity - peak
     wins = pnl[pnl > 0]
     losses = pnl[pnl < 0]
