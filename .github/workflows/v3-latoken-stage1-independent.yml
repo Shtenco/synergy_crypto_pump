@@ -1,0 +1,175 @@
+name: V3 LATOKEN INDEPENDENT FROZEN OOS
+
+on:
+  push:
+    branches: [v3-profitability-audit-hardening]
+    paths:
+      - ".github/workflows/v3-latoken-stage1-independent.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  independent-oos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[v3,boosting,dev]'
+          python -m compileall -q src scripts
+      - name: Collect disjoint 20-day x 100-pair historical block
+        run: |
+          mkdir -p artifacts/v3/latoken_independent
+          python scripts/build_real_dataset_v2.py \
+            --skip-uniswap \
+            --latoken-days 20 \
+            --latoken-end-offset-days 11 \
+            --latoken-max-pairs 100 \
+            --latoken-chunk-hours 24 \
+            --latoken-workers 8 \
+            --min-bars 300 \
+            --out data/latoken_independent/panel.parquet \
+            --report artifacts/v3/latoken_independent/data_report.json
+          cat artifacts/v3/latoken_independent/data_report.json
+      - name: Select probability threshold on validation only
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import numpy as np
+          import pandas as pd
+          from scripts.v3_latoken_frozen_oos import (
+              SPEC, BARRIER, _read, _exact_grid, _add_causal_liquidity_proxy,
+              _split_times, _candidate_trades,
+          )
+          from crypto_pump.v2.features import V2FeatureBuilder
+          from crypto_pump.v3.labels import add_triple_barrier_labels
+          from crypto_pump.v3.model import V3TradingEnsemble
+          from crypto_pump.v3.execution import ExecutionCostModel
+          from crypto_pump.v3.portfolio import PortfolioPolicy, apply_portfolio_limits
+
+          source=Path('data/latoken_independent/panel.parquet')
+          raw=_add_causal_liquidity_proxy(_exact_grid(_read(source)))
+          featured=V2FeatureBuilder(benchmark_symbol='LATOKEN:BTCUSDT').transform(raw)
+          labeled=add_triple_barrier_labels(featured, specs=[BARRIER], entry_delay_bars=1)
+          train_times,val_times,oos_times=_split_times(labeled)
+          ts=labeled['timestamp']
+          train=labeled[ts.isin(train_times)].copy()
+          validation=labeled[ts.isin(val_times)].copy()
+          # IMPORTANT: OOS rows are not scored, summarized or inspected here.
+          model=V3TradingEnsemble(specs=[SPEC], model_kind='catboost').fit(train, validation)
+          pred=model.predict(validation)
+          pcol=f'pump_probability__{SPEC.name}'
+          probs=pd.to_numeric(pred[pcol], errors='coerce').dropna()
+          if probs.empty:
+              raise SystemExit('validation produced no probabilities')
+
+          # Pre-registered support rule: choose the HIGHEST validation-score
+          # threshold that yields >=30 executable validation trades. We do not
+          # optimize validation PnL, PF, win rate or any OOS statistic.
+          qs=[0.999,0.995,0.99,0.98,0.95,0.90,0.80,0.70,0.50,0.25,0.0]
+          thresholds=sorted({float(probs.quantile(q)) for q in qs}, reverse=True)
+          costs=ExecutionCostModel(
+              dex_fee_bps=10.0, base_slippage_bps=25.0, gas_usd=0.0,
+              mev_haircut_bps=0.0, failure_rate=0.0, failed_tx_cost_usd=0.0,
+              latency_bars=1, impact_coefficient=0.50,
+              min_liquidity_usd=5000.0, max_impact_bps=300.0,
+          )
+          policy=PortfolioPolicy(
+              initial_equity_usd=5000.0, max_total_exposure_fraction=0.10,
+              max_position_fraction_equity=0.02, max_concurrent_positions=10,
+              max_daily_loss_fraction=0.02, one_open_position_per_symbol=True,
+          )
+          trials=[]
+          chosen=None
+          for threshold in thresholds:
+              cand=_candidate_trades(labeled, validation, pred, threshold=threshold,
+                                     top_k=10, notional_usd=50.0, costs=costs)
+              port=apply_portfolio_limits(cand, policy)
+              executable=int(port.get('executable', pd.Series(dtype=bool)).fillna(False).sum()) if len(port) else 0
+              trials.append({'threshold':threshold,'raw_candidates':int(len(cand)),'executable_trades':executable})
+              if chosen is None and executable >= 30:
+                  chosen=threshold
+          if chosen is None:
+              best=max(trials, key=lambda x:x['executable_trades'])
+              if best['executable_trades'] < 10:
+                  raise SystemExit(f'fail closed: insufficient validation execution support: {trials}')
+              chosen=float(best['threshold'])
+          out={
+              'selection_rule':'highest validation probability threshold with >=30 executable trades; fallback requires >=10',
+              'threshold':float(chosen),
+              'validation_probability_min':float(probs.min()),
+              'validation_probability_median':float(probs.median()),
+              'validation_probability_max':float(probs.max()),
+              'trials':trials,
+              'train_rows':int(len(train)),
+              'validation_rows':int(len(validation)),
+              'oos_rows_reserved_uninspected':int(ts.isin(oos_times).sum()),
+          }
+          Path('artifacts/v3/latoken_independent/validation_threshold.json').write_text(json.dumps(out,indent=2))
+          print(json.dumps(out,indent=2))
+          PY
+      - name: Freeze threshold and run untouched OOS exactly once
+        run: |
+          THRESHOLD="$(python -c "import json; print(json.load(open('artifacts/v3/latoken_independent/validation_threshold.json'))['threshold'])")"
+          echo "Frozen validation-only threshold=$THRESHOLD"
+          python scripts/v3_latoken_frozen_oos.py \
+            data/latoken_independent/panel.parquet \
+            artifacts/v3/latoken_independent/result \
+            --threshold "$THRESHOLD" \
+            --top-k 10 \
+            --notional-usd 50 \
+            --initial-equity-usd 5000 \
+            | tee artifacts/v3/latoken_independent/final_stdout.json
+      - name: Publish independent OOS verdict
+        if: always()
+        run: |
+          if [ -f artifacts/v3/latoken_independent/result/latoken_frozen_oos_report.json ]; then
+            python - <<'PY'
+          import json, os
+          r=json.load(open('artifacts/v3/latoken_independent/result/latoken_frozen_oos_report.json'))
+          t=json.load(open('artifacts/v3/latoken_independent/validation_threshold.json'))
+          f=r.get('financial',{}); s=r.get('execution_stress',{}); w=r.get('winner_stress',{})
+          out={
+              'frozen_threshold':t.get('threshold'),
+              'rows':r.get('data_quality',{}).get('rows'),
+              'symbols':r.get('data_quality',{}).get('symbols'),
+              'Trades':f.get('trades'),
+              'Net PnL':f.get('net_pnl_usd'),
+              'PnL %':f.get('pnl_pct_initial_equity'),
+              'Expectancy':f.get('expectancy_usd'),
+              'Win rate':f.get('win_rate'),
+              'Profit Factor':f.get('profit_factor'),
+              'Max DD':f.get('max_drawdown_usd'),
+              'Sharpe':f.get('sharpe_per_trade'),
+              'average holding time':f.get('average_holding_minutes'),
+              'costs x2 PnL':(s.get('costs_x2') or {}).get('net_pnl_usd'),
+              'latency x2 PnL':(s.get('latency_x2') or {}).get('net_pnl_usd'),
+              'top-1% removed PnL':(w.get('remove_top_1pct') or {}).get('net_pnl_usd'),
+              'stage1_gate_passed':r.get('stage1_gate_passed'),
+          }
+          print(json.dumps(out,indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as fh:
+              fh.write('## Independent LATOKEN Frozen OOS\n\n```json\n'+json.dumps(out,indent=2)+'\n```\n')
+          PY
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: latoken-independent-frozen-${{ github.run_id }}
+          path: |
+            artifacts/v3/latoken_independent/
+            data/latoken_independent/panel.parquet
+          if-no-files-found: warn
+          retention-days: 30
