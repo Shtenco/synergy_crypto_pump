@@ -1,0 +1,102 @@
+name: V3 LATOKEN STAGE1 FROZEN OOS
+
+on:
+  push:
+    branches: [v3-profitability-audit-hardening]
+    paths:
+      - ".github/workflows/v3-latoken-stage1.yml"
+      - "scripts/v3_latoken_frozen_oos.py"
+      - "src/crypto_pump/data_sources/**"
+      - "src/crypto_pump/v2/**"
+      - "src/crypto_pump/v3/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  latoken-stage1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[v3,boosting,dev]'
+          python -m compileall -q src scripts
+      - name: Collect immutable 10-day x 100-pair LATOKEN panel
+        run: |
+          mkdir -p artifacts/v3/latoken_stage1
+          python scripts/build_real_dataset_v2.py \
+            --skip-uniswap \
+            --latoken-days 10 \
+            --latoken-max-pairs 100 \
+            --latoken-chunk-hours 24 \
+            --latoken-workers 8 \
+            --min-bars 300 \
+            --out data/latoken_stage1/panel.parquet \
+            --report artifacts/v3/latoken_stage1/data_report.json
+          ls -lh data/latoken_stage1/panel.parquet
+          cat artifacts/v3/latoken_stage1/data_report.json
+      - name: Frozen pre-OOS retrain and untouched OOS profitability test
+        run: |
+          python scripts/v3_latoken_frozen_oos.py \
+            data/latoken_stage1/panel.parquet \
+            artifacts/v3/latoken_stage1/result \
+            --threshold 0.70 \
+            --top-k 10 \
+            --notional-usd 50 \
+            --initial-equity-usd 5000 \
+            | tee artifacts/v3/latoken_stage1/final_stdout.json
+      - name: Publish final Stage-1 metrics
+        if: always()
+        run: |
+          if [ -f artifacts/v3/latoken_stage1/result/latoken_frozen_oos_report.json ]; then
+            python - <<'PY'
+          import json, os
+          p='artifacts/v3/latoken_stage1/result/latoken_frozen_oos_report.json'
+          r=json.load(open(p))
+          f=r.get('financial',{})
+          s=r.get('execution_stress',{})
+          w=r.get('winner_stress',{})
+          out={
+            'rows':r.get('data_quality',{}).get('rows'),
+            'symbols':r.get('data_quality',{}).get('symbols'),
+            'Trades':f.get('trades'),
+            'Net PnL':f.get('net_pnl_usd'),
+            'PnL %':f.get('pnl_pct_initial_equity'),
+            'Expectancy':f.get('expectancy_usd'),
+            'Win rate':f.get('win_rate'),
+            'Profit Factor':f.get('profit_factor'),
+            'Max DD':f.get('max_drawdown_usd'),
+            'Sharpe':f.get('sharpe_per_trade'),
+            'average holding time':f.get('average_holding_minutes'),
+            'costs x2 PnL':(s.get('costs_x2') or {}).get('net_pnl_usd'),
+            'latency x2 PnL':(s.get('latency_x2') or {}).get('net_pnl_usd'),
+            'top-1% removed PnL':(w.get('remove_top_1pct') or {}).get('net_pnl_usd'),
+            'stage1_gate_passed':r.get('stage1_gate_passed'),
+          }
+          print(json.dumps(out,indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as fh:
+              fh.write('## LATOKEN 10d x100 FROZEN OOS\n\n```json\n')
+              fh.write(json.dumps(out,indent=2))
+              fh.write('\n```\n')
+          PY
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: latoken-stage1-frozen-${{ github.run_id }}
+          path: |
+            artifacts/v3/latoken_stage1/
+            data/latoken_stage1/panel.parquet
+          if-no-files-found: warn
+          retention-days: 30
