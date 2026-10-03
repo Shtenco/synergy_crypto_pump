@@ -90,6 +90,7 @@ jobs:
             echo 'No panel.parquet found' >&2
             exit 2
           fi
+          export PANEL
           echo "PANEL=$PANEL" >> "$GITHUB_ENV"
           python - <<'PY'
           import os, hashlib, pandas as pd
