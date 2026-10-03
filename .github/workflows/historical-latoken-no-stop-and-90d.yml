@@ -1,0 +1,168 @@
+name: HISTORICAL LATOKEN NO-STOP + 90D X3
+
+on:
+  push:
+    branches: [v3-profitability-audit-hardening]
+    paths:
+      - ".github/workflows/historical-latoken-no-stop-and-90d.yml"
+      - "scripts/simulate_historical_latoken_no_stops.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SOURCE_LARGE_RUN_ID: "34525317429"
+  HISTORICAL_BASELINE_RUN_ID: "34542962416"
+  HISTORICAL_CODE_SHA: "66f84223e9ddd9108a0132e2d66156518707394f"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  no-stop-simulation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v3-profitability-audit-hardening
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.16"
+      - name: Install stack
+        run: |
+          pip install -e .
+          pip install 'catboost==1.2.10'
+      - name: Download immutable historical LARGE dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: crypto-pump-v2-large-34525317429
+          path: historical_source
+          github-token: ${{ github.token }}
+          repository: Shtenco/synergy_crypto_pump
+          run-id: ${{ env.SOURCE_LARGE_RUN_ID }}
+      - name: Download original historical baseline models
+        uses: actions/download-artifact@v4
+        with:
+          name: latoken-large-baseline-34542962416
+          path: historical_models
+          github-token: ${{ github.token }}
+          repository: Shtenco/synergy_crypto_pump
+          run-id: ${{ env.HISTORICAL_BASELINE_RUN_ID }}
+      - name: Simulate historical Top-10 trades without stop losses
+        run: |
+          mkdir -p artifacts/no_stop
+          LABELED=$(find historical_source -type f -path '*/real_v2/labeled.parquet' | head -1)
+          test -n "$LABELED"
+          python scripts/simulate_historical_latoken_no_stops.py "$LABELED" historical_models artifacts/no_stop --top-k 10 --notional-usd 50
+          cat artifacts/no_stop/historical_no_stop_report.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: historical-latoken-no-stop-${{ github.run_id }}
+          path: artifacts/no_stop/
+          retention-days: 30
+
+  collect-90d-shards:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        end_offset_days: [0, 15, 30, 45, 60, 75]
+        pair_offset: [0, 200, 400, 600, 800, 1000]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HISTORICAL_CODE_SHA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.16"
+      - name: Install historical collector stack
+        run: |
+          pip install -e .
+      - name: Collect historical 15-day LATOKEN shard
+        id: collect
+        continue-on-error: true
+        run: |
+          mkdir -p shard
+          python scripts/build_real_dataset_v2.py \
+            --skip-uniswap \
+            --latoken-days 15 \
+            --latoken-end-offset-days "${{ matrix.end_offset_days }}" \
+            --latoken-pair-offset "${{ matrix.pair_offset }}" \
+            --latoken-max-pairs 200 \
+            --latoken-chunk-hours 24 \
+            --latoken-workers 4 \
+            --min-bars 1 \
+            --out shard/panel.parquet \
+            --report shard/report.json
+      - name: Show shard report
+        if: always()
+        run: |
+          test ! -f shard/report.json || cat shard/report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: latoken-90d-t${{ matrix.end_offset_days }}-p${{ matrix.pair_offset }}
+          path: shard/
+          if-no-files-found: warn
+          retention-days: 14
+
+  train-90d:
+    needs: collect-90d-shards
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HISTORICAL_CODE_SHA }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.16"
+      - name: Install exact historical training stack
+        run: |
+          python -m pip install --upgrade 'pip==26.2.1'
+          pip install -e . --no-deps
+          pip install \
+            'numpy==2.4.6' 'pandas==3.0.5' 'scikit-learn==1.9.1' \
+            'scipy==1.17.1' 'joblib==1.6.0' 'pyarrow==25.0.1' \
+            'pyyaml==6.0.3' 'typer==0.27.2' 'catboost==1.2.10'
+      - name: Download all 90d shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: latoken-90d-*
+          path: downloaded/latoken90
+          merge-multiple: false
+      - name: Merge 90d contiguous histories
+        run: |
+          mkdir -p data/latoken90 artifacts/latoken90/model
+          python scripts/merge_real_shards.py downloaded/latoken90 \
+            --min-bars 600 \
+            --out data/latoken90/panel.parquet \
+            --report artifacts/latoken90/data_report.json
+          cat artifacts/latoken90/data_report.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Build exact historical causal features and labels
+        run: |
+          crypto-pump features-v2 data/latoken90/panel.parquet data/latoken90/features.parquet --benchmark-symbol LATOKEN:BTCUSDT
+          crypto-pump labels-v2 data/latoken90/features.parquet data/latoken90/labeled.parquet
+      - name: Train exact historical CatBoost baseline on 90d
+        run: |
+          python scripts/train_large_baseline.py \
+            data/latoken90/labeled.parquet \
+            artifacts/latoken90/model \
+            --iterations 150 \
+            --depth 6 \
+            --learning-rate 0.06 \
+            --test-fraction 0.25 \
+            --embargo-bars 12 \
+            --top-k 10
+          cat artifacts/latoken90/model/baseline_oos_metrics.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: latoken-90d-baseline-${{ github.run_id }}
+          path: artifacts/latoken90/
+          if-no-files-found: warn
+          retention-days: 30
