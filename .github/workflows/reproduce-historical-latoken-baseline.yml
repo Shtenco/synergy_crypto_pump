@@ -1,0 +1,187 @@
+name: REPRODUCE HISTORICAL LATOKEN BASELINE
+
+on:
+  push:
+    branches: [v3-profitability-audit-hardening]
+    paths:
+      - ".github/workflows/reproduce-historical-latoken-baseline.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SOURCE_LARGE_RUN_ID: "34525317429"
+  HISTORICAL_BASELINE_RUN_ID: "34542962416"
+  HISTORICAL_CODE_SHA: "66f84223e9ddd9108a0132e2d66156518707394f"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout exact historical code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HISTORICAL_CODE_SHA }}
+          fetch-depth: 1
+
+      - name: Set up exact historical Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.16"
+
+      - name: Install historical package versions
+        run: |
+          python -m pip install --upgrade 'pip==26.2.1'
+          pip install -e . --no-deps
+          pip install \
+            'numpy==2.4.6' \
+            'pandas==3.0.5' \
+            'scikit-learn==1.9.1' \
+            'scipy==1.17.1' \
+            'joblib==1.6.0' \
+            'pyarrow==25.0.1' \
+            'pyyaml==6.0.3' \
+            'typer==0.27.2' \
+            'catboost==1.2.10'
+          python - <<'PY'
+          import sys, numpy, pandas, sklearn, scipy, joblib, pyarrow, catboost
+          print('python', sys.version)
+          print('numpy', numpy.__version__)
+          print('pandas', pandas.__version__)
+          print('sklearn', sklearn.__version__)
+          print('scipy', scipy.__version__)
+          print('joblib', joblib.__version__)
+          print('pyarrow', pyarrow.__version__)
+          print('catboost', catboost.__version__)
+          PY
+
+      - name: Download immutable historical LARGE dataset artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: crypto-pump-v2-large-34525317429
+          path: historical_source
+          github-token: ${{ github.token }}
+          repository: Shtenco/synergy_crypto_pump
+          run-id: ${{ env.SOURCE_LARGE_RUN_ID }}
+
+      - name: Download original successful baseline metrics/models
+        uses: actions/download-artifact@v4
+        with:
+          name: latoken-large-baseline-34542962416
+          path: historical_result
+          github-token: ${{ github.token }}
+          repository: Shtenco/synergy_crypto_pump
+          run-id: ${{ env.HISTORICAL_BASELINE_RUN_ID }}
+
+      - name: Locate and audit immutable panel
+        id: locate
+        run: |
+          echo 'Historical source contents:'
+          find historical_source -maxdepth 5 -type f -printf '%p %s bytes\n' | sort | head -100
+          PANEL=$(find historical_source -type f -path '*/large_v2/panel.parquet' | head -1)
+          if [ -z "$PANEL" ]; then
+            PANEL=$(find historical_source -type f -name 'panel.parquet' | head -1)
+          fi
+          if [ -z "$PANEL" ]; then
+            echo 'No panel.parquet found' >&2
+            exit 2
+          fi
+          echo "PANEL=$PANEL" >> "$GITHUB_ENV"
+          python - <<'PY'
+          import os, hashlib, pandas as pd
+          p=os.environ['PANEL']
+          h=hashlib.sha256()
+          with open(p,'rb') as f:
+              for b in iter(lambda:f.read(8*1024*1024),b''): h.update(b)
+          d=pd.read_parquet(p, columns=['timestamp','symbol'])
+          d['timestamp']=pd.to_datetime(d['timestamp'],utc=True)
+          print('panel_sha256',h.hexdigest())
+          print('rows',len(d))
+          print('symbols',d['symbol'].nunique())
+          print('timestamps',d['timestamp'].nunique())
+          print('timestamp_min',d['timestamp'].min())
+          print('timestamp_max',d['timestamp'].max())
+          PY
+
+      - name: Rebuild causal V2 features and strict historical targets
+        run: |
+          mkdir -p reproduce artifacts/reproduce/model
+          crypto-pump features-v2 "$PANEL" reproduce/features.parquet --benchmark-symbol LATOKEN:BTCUSDT
+          crypto-pump labels-v2 reproduce/features.parquet reproduce/labeled.parquet
+          python - <<'PY'
+          import pandas as pd
+          p='reproduce/labeled.parquet'
+          d=pd.read_parquet(p)
+          print('labeled_rows',len(d))
+          print('labeled_symbols',d['symbol'].nunique())
+          print('labeled_timestamps',d['timestamp'].nunique())
+          print('columns',len(d.columns))
+          for c in ['target__up10_15m','target__up20_1h','target__up50_6h','target__up100_24h']:
+              x=d[c]
+              print(c,'valid',int(x.notna().sum()),'positives',int(x.fillna(0).sum()))
+          PY
+
+      - name: Repeat exact historical CatBoost holdout training
+        run: |
+          python scripts/train_large_baseline.py \
+            reproduce/labeled.parquet \
+            artifacts/reproduce/model \
+            --iterations 150 \
+            --depth 6 \
+            --learning-rate 0.06 \
+            --test-fraction 0.25 \
+            --embargo-bars 12 \
+            --top-k 10
+
+      - name: Compare reproduction against original run 34542962416
+        run: |
+          python - <<'PY'
+          import json, math, pathlib
+          new=json.load(open('artifacts/reproduce/model/baseline_oos_metrics.json'))
+          old_path=next(pathlib.Path('historical_result').rglob('baseline_oos_metrics.json'))
+          old=json.load(open(old_path))
+          compare_keys=['test_positive_rate','pr_auc','roc_auc','brier','log_loss','precision_at_10','lift_at_10','ndcg_at_10']
+          summary={
+              'historical_run_id':34542962416,
+              'historical_code_sha':'66f84223e9ddd9108a0132e2d66156518707394f',
+              'rows_old':old['rows'],'rows_new':new['rows'],
+              'feature_count_old':old['feature_count'],'feature_count_new':new['feature_count'],
+              'train_timestamp_max_old':old['train_timestamp_max'],'train_timestamp_max_new':new['train_timestamp_max'],
+              'test_timestamp_min_old':old['test_timestamp_min'],'test_timestamp_min_new':new['test_timestamp_min'],
+              'targets':{}
+          }
+          max_abs=0.0
+          for t in old['targets']:
+              o=old['targets'][t]; n=new['targets'][t]
+              x={}
+              for k in ['train_rows','test_rows','train_positives','test_positives']:
+                  x[k+'_old']=o.get(k); x[k+'_new']=n.get(k); x[k+'_equal']=o.get(k)==n.get(k)
+              for k in compare_keys:
+                  ov=o.get(k); nv=n.get(k)
+                  diff=None if ov is None or nv is None else float(nv)-float(ov)
+                  if diff is not None and math.isfinite(diff): max_abs=max(max_abs,abs(diff))
+                  x[k+'_old']=ov; x[k+'_new']=nv; x[k+'_diff']=diff
+              summary['targets'][t]=x
+          summary['max_abs_metric_diff']=max_abs
+          summary['dataset_identity_counts']=(old['rows']==new['rows'] and old['segmented_symbols']==new['segmented_symbols'] and old['unique_timestamps']==new['unique_timestamps'])
+          pathlib.Path('artifacts/reproduce/reproduction_comparison.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          print(json.dumps(summary,indent=2))
+          with open(pathlib.Path(__import__('os').environ['GITHUB_STEP_SUMMARY']),'a') as f:
+              f.write('## Historical LATOKEN baseline reproduction\n\n```json\n')
+              f.write(json.dumps(summary,indent=2))
+              f.write('\n```\n')
+          PY
+
+      - name: Upload reproduction
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: historical-latoken-baseline-reproduction-${{ github.run_id }}
+          path: |
+            artifacts/reproduce/
+          if-no-files-found: warn
+          retention-days: 30
