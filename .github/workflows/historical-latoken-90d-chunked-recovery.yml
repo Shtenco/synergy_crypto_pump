@@ -1,0 +1,204 @@
+name: HISTORICAL LATOKEN 90D CHUNKED RECOVERY
+
+on:
+  push:
+    branches: [v3-profitability-audit-hardening]
+    paths:
+      - ".github/workflows/historical-latoken-90d-chunked-recovery.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  HISTORICAL_CODE_SHA: "66f84223e9ddd9108a0132e2d66156518707394f"
+  SOURCE_90D_RUN_ID: "37129580695"
+  HISTORICAL_BASELINE_RUN_ID: "34542962416"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  prepare-panel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HISTORICAL_CODE_SHA }}
+          path: historical
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.16"
+      - name: Install exact historical merge stack
+        run: |
+          python -m pip install --upgrade 'pip==26.2.1'
+          pip install -e historical --no-deps
+          pip install 'numpy==2.4.6' 'pandas==3.0.5' 'pyarrow==25.0.1' 'pyyaml==6.0.3' 'typer==0.27.2'
+      - name: Download immutable 36 LATOKEN shards from prior run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: latoken-90d-*
+          path: downloaded/latoken90
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: Shtenco/synergy_crypto_pump
+          run-id: ${{ env.SOURCE_90D_RUN_ID }}
+      - name: Merge exact 90d contiguous histories
+        run: |
+          mkdir -p prepared artifacts
+          python historical/scripts/merge_real_shards.py downloaded/latoken90 \
+            --min-bars 600 \
+            --out prepared/panel.parquet \
+            --report artifacts/data_report.json
+          cat artifacts/data_report.json
+      - name: Upload immutable merged 90d panel
+        uses: actions/upload-artifact@v4
+        with:
+          name: latoken-90d-merged-panel-${{ github.run_id }}
+          path: |
+            prepared/panel.parquet
+            artifacts/data_report.json
+          retention-days: 14
+
+  build-buckets:
+    needs: prepare-panel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        bucket: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HISTORICAL_CODE_SHA }}
+          path: historical
+      - uses: actions/checkout@v4
+        with:
+          ref: v3-profitability-audit-hardening
+          path: audit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.16"
+      - name: Install exact historical feature stack
+        run: |
+          python -m pip install --upgrade 'pip==26.2.1'
+          pip install -e historical --no-deps
+          pip install 'numpy==2.4.6' 'pandas==3.0.5' 'pyarrow==25.0.1' 'pyyaml==6.0.3' 'typer==0.27.2'
+      - name: Download merged panel
+        uses: actions/download-artifact@v4
+        with:
+          name: latoken-90d-merged-panel-${{ github.run_id }}
+          path: prepared
+      - name: Build exact historical V2 features and labels for symbol bucket
+        run: |
+          mkdir -p out/bucket-${{ matrix.bucket }}
+          python audit/scripts/build_v2_labeled_bucket.py \
+            prepared/prepared/panel.parquet \
+            out/bucket-${{ matrix.bucket }}/labeled_part.parquet \
+            --bucket-index ${{ matrix.bucket }} \
+            --bucket-count 16 \
+            --benchmark-symbol LATOKEN:BTCUSDT
+      - name: Upload labeled bucket
+        uses: actions/upload-artifact@v4
+        with:
+          name: latoken-90d-labeled-bucket-${{ matrix.bucket }}-${{ github.run_id }}
+          path: out/bucket-${{ matrix.bucket }}/labeled_part.parquet
+          retention-days: 14
+
+  finalize-ranks:
+    needs: build-buckets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v3-profitability-audit-hardening
+          path: audit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.16"
+      - name: Install disk-backed rank stack
+        run: pip install 'duckdb==1.4.1'
+      - name: Download all labeled feature buckets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: latoken-90d-labeled-bucket-*-${{ github.run_id }}
+          path: parts
+          merge-multiple: false
+      - name: Recompute exact full-universe cross-sectional ranks
+        run: |
+          mkdir -p final
+          python audit/scripts/finalize_v2_cross_sectional.py \
+            'parts/**/labeled_part.parquet' final \
+            --threads 4 --memory-limit 4GB
+          find final -maxdepth 1 -name 'bucket-*.parquet' -printf '%f %s bytes\n' | sort
+      - name: Upload finalized partitioned labeled dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: latoken-90d-final-labeled-${{ github.run_id }}
+          path: final/bucket-*.parquet
+          compression-level: 1
+          retention-days: 14
+
+  train-oos:
+    needs: finalize-ranks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HISTORICAL_CODE_SHA }}
+          path: historical
+      - uses: actions/checkout@v4
+        with:
+          ref: v3-profitability-audit-hardening
+          path: audit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.16"
+      - name: Install exact historical CatBoost stack plus disk query engine
+        run: |
+          python -m pip install --upgrade 'pip==26.2.1'
+          pip install -e historical --no-deps
+          pip install \
+            'numpy==2.4.6' 'pandas==3.0.5' 'scikit-learn==1.9.1' \
+            'scipy==1.17.1' 'joblib==1.6.0' 'pyarrow==25.0.1' \
+            'pyyaml==6.0.3' 'typer==0.27.2' 'catboost==1.2.10' 'duckdb==1.4.1'
+      - name: Download finalized 90d labeled partitions
+        uses: actions/download-artifact@v4
+        with:
+          name: latoken-90d-final-labeled-${{ github.run_id }}
+          path: final
+      - name: Download original 30d baseline models for exact 71-feature schema
+        uses: actions/download-artifact@v4
+        with:
+          name: latoken-large-baseline-34542962416
+          path: reference
+          github-token: ${{ github.token }}
+          repository: Shtenco/synergy_crypto_pump
+          run-id: ${{ env.HISTORICAL_BASELINE_RUN_ID }}
+      - name: Train exact historical CatBoost x4 and open final 25% OOS
+        run: |
+          REF=$(find reference -type f -name 'catboost_baseline_up20_1h.cbm' | head -1)
+          test -n "$REF"
+          mkdir -p result
+          python audit/scripts/train_large_baseline_partitioned.py \
+            'final/bucket-*.parquet' "$REF" result \
+            --iterations 150 \
+            --depth 6 \
+            --learning-rate 0.06 \
+            --test-fraction 0.25 \
+            --embargo-bars 12 \
+            --top-k 10 \
+            --memory-limit 4GB
+          cat result/baseline_oos_metrics.json
+      - name: Upload final 90d OOS models and metrics
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: latoken-90d-chunked-oos-${{ github.run_id }}
+          path: result/
+          if-no-files-found: warn
+          retention-days: 30
