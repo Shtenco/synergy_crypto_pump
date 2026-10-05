@@ -13,55 +13,13 @@ permissions:
 
 env:
   HISTORICAL_CODE_SHA: "66f84223e9ddd9108a0132e2d66156518707394f"
-  SOURCE_90D_RUN_ID: "37129580695"
+  MERGED_PANEL_RUN_ID: "37379053008"
+  MERGED_PANEL_ARTIFACT: "latoken-90d-merged-panel-37379053008"
   HISTORICAL_BASELINE_RUN_ID: "34542962416"
   PYTHONUNBUFFERED: "1"
 
 jobs:
-  prepare-panel:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.HISTORICAL_CODE_SHA }}
-          path: historical
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11.16"
-      - name: Install exact historical merge stack
-        run: |
-          python -m pip install --upgrade 'pip==26.2.1'
-          pip install -e historical --no-deps
-          pip install 'numpy==2.4.6' 'pandas==3.0.5' 'pyarrow==25.0.1' 'pyyaml==6.0.3' 'typer==0.27.2'
-      - name: Download immutable 36 LATOKEN shards from prior run
-        uses: actions/download-artifact@v4
-        with:
-          pattern: latoken-90d-*
-          path: downloaded/latoken90
-          merge-multiple: false
-          github-token: ${{ github.token }}
-          repository: Shtenco/synergy_crypto_pump
-          run-id: ${{ env.SOURCE_90D_RUN_ID }}
-      - name: Merge exact 90d contiguous histories
-        run: |
-          mkdir -p prepared artifacts
-          python historical/scripts/merge_real_shards.py downloaded/latoken90 \
-            --min-bars 600 \
-            --out prepared/panel.parquet \
-            --report artifacts/data_report.json
-          cat artifacts/data_report.json
-      - name: Upload immutable merged 90d panel
-        uses: actions/upload-artifact@v4
-        with:
-          name: latoken-90d-merged-panel-${{ github.run_id }}
-          path: |
-            prepared/panel.parquet
-            artifacts/data_report.json
-          retention-days: 14
-
   build-buckets:
-    needs: prepare-panel
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -85,17 +43,25 @@ jobs:
         run: |
           python -m pip install --upgrade 'pip==26.2.1'
           pip install -e historical --no-deps
-          pip install 'numpy==2.4.6' 'pandas==3.0.5' 'pyarrow==25.0.1' 'pyyaml==6.0.3' 'typer==0.27.2'
-      - name: Download merged panel
+          pip install \
+            'numpy==2.4.6' 'pandas==3.0.5' 'pyarrow==25.0.1' \
+            'joblib==1.6.0' 'scikit-learn==1.9.1' 'scipy==1.17.1' \
+            'pyyaml==6.0.3' 'typer==0.27.2'
+      - name: Download already-merged immutable 90d panel
         uses: actions/download-artifact@v4
         with:
-          name: latoken-90d-merged-panel-${{ github.run_id }}
+          name: ${{ env.MERGED_PANEL_ARTIFACT }}
           path: prepared
+          github-token: ${{ github.token }}
+          repository: Shtenco/synergy_crypto_pump
+          run-id: ${{ env.MERGED_PANEL_RUN_ID }}
       - name: Build exact historical V2 features and labels for symbol bucket
         run: |
+          PANEL=$(find prepared -type f -name 'panel.parquet' | head -1)
+          test -n "$PANEL"
           mkdir -p out/bucket-${{ matrix.bucket }}
           python audit/scripts/build_v2_labeled_bucket.py \
-            prepared/prepared/panel.parquet \
+            "$PANEL" \
             out/bucket-${{ matrix.bucket }}/labeled_part.parquet \
             --bucket-index ${{ matrix.bucket }} \
             --bucket-count 16 \
