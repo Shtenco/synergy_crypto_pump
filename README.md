@@ -29,7 +29,7 @@ BTC / market benchmark ───────┘                │
                                                ├─> multi-horizon CatBoost
                                                ├─> CatBoost YetiRank / NDCG
 past-only symbol sequences ────────────────────┼─> causal Temporal Transformer
-wallet ↔ token edges (timestamp <= as_of) ─────┼─> Wallet/Transaction GNN
+wallet  token edges (timestamp <= as_of) ─────┼─> Wallet/Transaction GNN
 social-only feature family ────────────────────┼─> social branch
 BTC-relative residual ─────────────────────────┴─> BOCD regime score
                                                          │
@@ -179,17 +179,17 @@ Architecture details: [`docs/V2_ARCHITECTURE.md`](docs/V2_ARCHITECTURE.md).
 <!-- SYNERGY-FEDERATION-PASSPORT:START -->
 ---
 
-## 🧭 SYNERGY federation passport
+##  SYNERGY federation passport
 
-**Домен:** 📈 Crypto ML research  
+**Домен:**  Crypto ML research  
 **Архитектурный родитель:** [`synergy_midas_ai`](https://github.com/Shtenco/synergy_midas_ai)  
 **Архитектурный корень:** [`synergy_system`](https://github.com/Shtenco/synergy_system)
 
 ```mermaid
 flowchart LR
-    SYS[🧭 synergy_system] --> P[synergy_midas_ai]
+    SYS[ synergy_system] --> P[synergy_midas_ai]
     P --> THIS[synergy_crypto_pump]
-    THIS --> E[📦 Evidence / outputs]
+    THIS --> E[ Evidence / outputs]
 ```
 
 ### Документационный контракт
@@ -198,9 +198,9 @@ README должен показывать: проблему → архитект�
 
 ### Навигация
 
-- [📚 Атлас всех 75 репозиториев](https://github.com/Shtenco/synergy_system/blob/main/docs/SYNERGY_REPOSITORY_ATLAS.md)
-- [🧾 Машиночитаемый registry](https://github.com/Shtenco/synergy_system/blob/main/registry/SYNERGY_REPOSITORIES.json)
-- [🧭 SYNERGY SYSTEM](https://github.com/Shtenco/synergy_system)
+- [ Атлас всех 75 репозиториев](https://github.com/Shtenco/synergy_system/blob/main/docs/SYNERGY_REPOSITORY_ATLAS.md)
+- [ Машиночитаемый registry](https://github.com/Shtenco/synergy_system/blob/main/registry/SYNERGY_REPOSITORIES.json)
+- [ SYNERGY SYSTEM](https://github.com/Shtenco/synergy_system)
 
 ### Authority rule
 
@@ -210,7 +210,7 @@ README должен показывать: проблему → архитект�
 
 ---
 
-# 🚀 Глубокий доказательный паспорт Crypto Pump V2
+#  Глубокий доказательный паспорт Crypto Pump V2
 
 ## Реальная зрелость
 
