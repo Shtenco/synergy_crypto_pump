@@ -1,3 +1,9 @@
+<!-- SCIENTIFIC-V3-2026:START -->
+<img src="assets/readme/scientific-architecture-v3.svg" width="100%" alt="CRYPTO PUMP / MULTI-HORIZON RESEARCH"/>
+
+[Научно-техническое досье V3](docs/SCIENTIFIC_DOSSIER_V3_2026.md). Исходный README сохранён полностью.
+<!-- SCIENTIFIC-V3-2026:END -->
+
 # CRYPTO PUMP V2 — Unified Early-Pump ML Research Stack
 
 `crypto_pump` is a research monorepo for **forward prediction and cross-sectional ranking of abnormal upside in low-cap cryptocurrencies and memecoins**.
